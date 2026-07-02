@@ -1,9 +1,19 @@
 import { z } from "zod";
+import { readFile } from "node:fs/promises";
+import { extname } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { resolveChatTarget, type ResolveResult } from "./contacts.js";
 import * as db from "./db.js";
 import * as media from "./media.js";
 import { getSocket, getStatus } from "./whatsapp.js";
+
+const IMAGE_MIME_TYPES: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
 
 function json(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -111,7 +121,8 @@ export function registerTools(server: McpServer): void {
   server.registerTool(
     "download_media",
     {
-      description: "Download media van een ontvangen bericht naar schijf en geef het lokale bestandspad terug.",
+      description:
+        "Download media van een ontvangen bericht naar schijf. Afbeeldingen worden ook direct in het resultaat getoond; video/audio/documenten alleen als bestandspad.",
       inputSchema: {
         chat: z.string().describe("Naam, telefoonnummer of JID van de chat waarin het bericht staat"),
         message_id: z.string().describe("Het bericht-ID van het mediabericht"),
@@ -122,6 +133,16 @@ export function registerTools(server: McpServer): void {
       if (!resolved.ok) return resolved.response;
       try {
         const path = await media.downloadIncomingMedia(resolved.jid, message_id);
+        const mimeType = IMAGE_MIME_TYPES[extname(path).toLowerCase()];
+        if (mimeType) {
+          const data = (await readFile(path)).toString("base64");
+          return {
+            content: [
+              { type: "text" as const, text: `Afbeelding gedownload naar ${path}` },
+              { type: "image" as const, data, mimeType },
+            ],
+          };
+        }
         return json({ path });
       } catch (err) {
         return error(err instanceof Error ? err.message : String(err));
