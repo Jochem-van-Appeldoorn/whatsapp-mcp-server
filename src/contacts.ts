@@ -1,4 +1,4 @@
-import { getChat, searchChatsByName, searchContacts as searchContactsDb } from "./db.js";
+import { getDisplayName, searchChatsByName, searchContacts as searchContactsDb } from "./db.js";
 
 export type ResolveResult =
   | { type: "resolved"; jid: string; name: string | null }
@@ -6,7 +6,7 @@ export type ResolveResult =
   | { type: "not_found" };
 
 export function isJid(input: string): boolean {
-  return input.includes("@s.whatsapp.net") || input.includes("@g.us");
+  return input.includes("@s.whatsapp.net") || input.includes("@g.us") || input.includes("@lid");
 }
 
 function looksLikePhoneNumber(input: string): boolean {
@@ -26,12 +26,12 @@ export function resolveChatTarget(input: string, opts: { groupOnly?: boolean; di
   const trimmed = input.trim();
 
   if (isJid(trimmed)) {
-    const chat = getChat(trimmed);
-    return { type: "resolved", jid: trimmed, name: chat?.name ?? null };
+    return { type: "resolved", jid: trimmed, name: getDisplayName(trimmed) };
   }
 
   if (!opts.groupOnly && looksLikePhoneNumber(trimmed)) {
-    return { type: "resolved", jid: phoneToJid(trimmed), name: null };
+    const jid = phoneToJid(trimmed);
+    return { type: "resolved", jid, name: getDisplayName(jid) };
   }
 
   const candidates = new Map<string, string | null>();

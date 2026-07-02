@@ -213,6 +213,18 @@ export function getContact(jid: string): ContactRow | undefined {
   return db.prepare(`SELECT * FROM contacts WHERE jid = ?`).get(jid) as ContactRow | undefined;
 }
 
+/**
+ * Best-effort display name for a JID: contact name, then chat name
+ * (group subject), falling back to the bare phone number/id.
+ */
+export function getDisplayName(jid: string): string {
+  const contact = getContact(jid);
+  if (contact?.name) return contact.name;
+  const chat = getChat(jid);
+  if (chat?.name) return chat.name;
+  return jid.split("@")[0];
+}
+
 export function getUnansweredChats(thresholdMinutes: number): ChatRow[] {
   const cutoff = Date.now() - thresholdMinutes * 60_000;
   return db

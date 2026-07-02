@@ -1,5 +1,5 @@
 import notifier from "node-notifier";
-import { getUnansweredChats, markChatNotified } from "./db.js";
+import { getUnansweredChats, getDisplayName, markChatNotified } from "./db.js";
 
 export function startReminders(thresholdMinutes = 30, intervalMs = 5 * 60_000): NodeJS.Timeout {
   const check = () => {
@@ -8,7 +8,7 @@ export function startReminders(thresholdMinutes = 30, intervalMs = 5 * 60_000): 
       if (chat.last_notified_ts && chat.last_message_ts && chat.last_notified_ts >= chat.last_message_ts) {
         continue; // already notified for this message
       }
-      const displayName = chat.name ?? chat.jid.split("@")[0];
+      const displayName = getDisplayName(chat.jid);
       notifier.notify({
         title: "Onbeantwoord WhatsApp-bericht",
         message: `${displayName} wacht al meer dan ${thresholdMinutes} minuten op antwoord`,

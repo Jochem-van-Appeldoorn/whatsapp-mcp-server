@@ -36,6 +36,24 @@ function toEpochMs(input?: string): number | undefined {
   return Number.isNaN(ms) ? undefined : ms;
 }
 
+function formatChat(chat: db.ChatRow) {
+  return { jid: chat.jid, name: db.getDisplayName(chat.jid), is_group: !!chat.is_group };
+}
+
+function formatMessage(msg: db.MessageRow) {
+  return {
+    chat: db.getDisplayName(msg.chat_jid),
+    chat_jid: msg.chat_jid,
+    id: msg.id,
+    from_me: !!msg.from_me,
+    sender: msg.from_me ? "Jij" : msg.sender ? db.getDisplayName(msg.sender) : db.getDisplayName(msg.chat_jid),
+    text: msg.text,
+    type: msg.type,
+    media_path: msg.media_path,
+    timestamp: msg.timestamp,
+  };
+}
+
 export function registerTools(server: McpServer): void {
   server.registerTool(
     "send_message",
@@ -132,12 +150,10 @@ export function registerTools(server: McpServer): void {
     async ({ limit, include_groups }) => {
       const chats = db.getChats({ limit, includeGroups: include_groups });
       return json(
-        chats.map((chat) => ({
-          jid: chat.jid,
-          name: chat.name,
-          is_group: !!chat.is_group,
-          last_message: db.getLastInteraction(chat.jid),
-        }))
+        chats.map((chat) => {
+          const lastMessage = db.getLastInteraction(chat.jid);
+          return { ...formatChat(chat), last_message: lastMessage ? formatMessage(lastMessage) : null };
+        })
       );
     }
   );
@@ -164,17 +180,16 @@ export function registerTools(server: McpServer): void {
         if (!resolved.ok) return resolved.response;
         chatJid = resolved.jid;
       }
-      return json(
-        db.getMessages({
-          chatJid,
-          query,
-          sender,
-          dateFrom: toEpochMs(date_from),
-          dateTo: toEpochMs(date_to),
-          isFromMe: is_from_me,
-          limit,
-        })
-      );
+      const messages = db.getMessages({
+        chatJid,
+        query,
+        sender,
+        dateFrom: toEpochMs(date_from),
+        dateTo: toEpochMs(date_to),
+        isFromMe: is_from_me,
+        limit,
+      });
+      return json(messages.map(formatMessage));
     }
   );
 
@@ -194,7 +209,11 @@ export function registerTools(server: McpServer): void {
       if (!resolved.ok) return resolved.response;
       const context = db.getMessageContext(resolved.jid, message_id, before, after);
       if (!context) return error("Bericht niet gevonden in de lokale geschiedenis.");
-      return json(context);
+      return json({
+        before: context.before.map(formatMessage),
+        message: formatMessage(context.message),
+        after: context.after.map(formatMessage),
+      });
     }
   );
 
@@ -207,7 +226,8 @@ export function registerTools(server: McpServer): void {
     async ({ contact }) => {
       const resolved = requireResolved(resolveChatTarget(contact));
       if (!resolved.ok) return resolved.response;
-      return json(db.getLastInteraction(resolved.jid) ?? null);
+      const last = db.getLastInteraction(resolved.jid);
+      return json(last ? formatMessage(last) : null);
     }
   );
 
@@ -220,7 +240,8 @@ export function registerTools(server: McpServer): void {
     async ({ contact }) => {
       const resolved = requireResolved(resolveChatTarget(contact, { directOnly: true }));
       if (!resolved.ok) return resolved.response;
-      return json(db.getChat(resolved.jid) ?? { jid: resolved.jid, name: resolved.name });
+      const chat = db.getChat(resolved.jid);
+      return json(chat ? formatChat(chat) : { jid: resolved.jid, name: db.getDisplayName(resolved.jid), is_group: false });
     }
   );
 
@@ -233,14 +254,14 @@ export function registerTools(server: McpServer): void {
     async ({ contact }) => {
       const resolved = requireResolved(resolveChatTarget(contact, { directOnly: true }));
       if (!resolved.ok) return resolved.response;
-      return json(db.getChatsForSender(resolved.jid));
+      return json(db.getChatsForSender(resolved.jid).map(formatChat));
     }
   );
 
   server.registerTool(
     "list_groups",
     { description: "Toon alle groepschats.", inputSchema: {} },
-    async () => json(db.getGroups())
+    async () => json(db.getGroups().map(formatChat))
   );
 
   server.registerTool(
@@ -254,7 +275,10 @@ export function registerTools(server: McpServer): void {
       if (!resolved.ok) return resolved.response;
       try {
         const metadata = await getSocket().groupMetadata(resolved.jid);
-        return json(metadata);
+        return json({
+          ...metadata,
+          participants: metadata.participants.map((p) => ({ ...p, name: db.getDisplayName(p.id) })),
+        });
       } catch (err) {
         return error(err instanceof Error ? err.message : String(err));
       }
@@ -270,7 +294,7 @@ export function registerTools(server: McpServer): void {
         threshold_minutes: z.number().int().positive().optional().describe("Drempel in minuten (standaard 30)"),
       },
     },
-    async ({ threshold_minutes }) => json(db.getUnansweredChats(threshold_minutes ?? 30))
+    async ({ threshold_minutes }) => json(db.getUnansweredChats(threshold_minutes ?? 30).map(formatChat))
   );
 
   server.registerTool(
