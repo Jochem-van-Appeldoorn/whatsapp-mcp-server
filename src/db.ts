@@ -225,21 +225,24 @@ export function getDisplayName(jid: string): string {
   return jid.split("@")[0];
 }
 
-export function getUnansweredChats(thresholdMinutes: number): ChatRow[] {
-  const cutoff = Date.now() - thresholdMinutes * 60_000;
+export function getUnansweredChats(thresholdMinutes: number, maxAgeDays = 30): ChatRow[] {
+  const now = Date.now();
+  const cutoff = now - thresholdMinutes * 60_000;
+  const minTs = now - maxAgeDays * 24 * 60 * 60_000;
   return db
     .prepare(
       `SELECT c.* FROM chats c
        WHERE c.is_group = 0
          AND c.last_message_ts IS NOT NULL
          AND c.last_message_ts <= @cutoff
+         AND c.last_message_ts >= @minTs
          AND EXISTS (
            SELECT 1 FROM messages m
            WHERE m.chat_jid = c.jid AND m.timestamp = c.last_message_ts AND m.from_me = 0
          )
        ORDER BY c.last_message_ts ASC`
     )
-    .all({ cutoff }) as ChatRow[];
+    .all({ cutoff, minTs }) as ChatRow[];
 }
 
 export function markChatNotified(jid: string, ts: number) {
