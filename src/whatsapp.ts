@@ -9,9 +9,9 @@ import makeWASocket, {
 import { Boom } from "@hapi/boom";
 import qrcode from "qrcode-terminal";
 import pino from "pino";
-import { writeFile } from "node:fs/promises";
+import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { AUTH_DIR, DOWNLOADS_DIR } from "./paths.js";
+import { AUTH_DIR, DOWNLOADS_DIR, CONFIG_DIR } from "./paths.js";
 import { insertMessage, upsertContact, upsertChat, upsertMediaMessage, getMediaMessageRaw, type MessageRow } from "./db.js";
 
 const MEDIA_TYPES = new Set(["image", "video", "audio", "document", "sticker"]);
@@ -125,9 +125,11 @@ export async function connectWhatsApp(): Promise<void> {
     if (qr) {
       console.log("\nScan deze QR-code met WhatsApp (Gekoppelde apparaten > Apparaat koppelen):\n");
       qrcode.generate(qr, { small: true });
+      writeFile(join(CONFIG_DIR, "qr.txt"), qr).catch(() => {});
     }
 
     if (connection === "open") {
+      rm(join(CONFIG_DIR, "qr.txt"), { force: true }).catch(() => {});
       connectionState = "open";
       lastConnectedAt = Date.now();
       linkedNumber = sock?.user?.id?.split(":")[0];
