@@ -9,7 +9,13 @@ const PORT = Number(process.env.WHATSAPP_MCP_PORT ?? 8765);
 const REMINDER_THRESHOLD_MINUTES = Number(process.env.WHATSAPP_MCP_REMINDER_MINUTES ?? 30);
 
 function createServer(): McpServer {
-  const server = new McpServer({ name: "whatsapp-mcp-server", version: "1.0.0" });
+  const server = new McpServer(
+    { name: "whatsapp-mcp-server", version: "1.1.0" },
+    {
+      instructions:
+        "Alle tijden zijn Europe/Amsterdam. Gebruik voor tijdsverwijzingen in berichten ('over 3 uur', 'morgen') altijd de actuele tijd uit de Nu:-regel in toolresultaten of get_current_time — nooit een aanname. Berichtlijsten zijn compact: [tijd] afzender: tekst.",
+    }
+  );
   registerTools(server);
   return server;
 }
