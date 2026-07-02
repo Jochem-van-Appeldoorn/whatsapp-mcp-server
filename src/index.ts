@@ -10,10 +10,13 @@ const REMINDER_THRESHOLD_MINUTES = Number(process.env.WHATSAPP_MCP_REMINDER_MINU
 
 function createServer(): McpServer {
   const server = new McpServer(
-    { name: "whatsapp-mcp-server", version: "1.1.0" },
+    { name: "whatsapp-mcp-server", version: "1.2.0" },
     {
       instructions:
-        "Alle tijden zijn Europe/Amsterdam. Gebruik voor tijdsverwijzingen in berichten ('over 3 uur', 'morgen') altijd de actuele tijd uit de Nu:-regel in toolresultaten of get_current_time — nooit een aanname. Berichtlijsten zijn compact: [tijd] afzender: tekst.",
+        "Alle tijden zijn Europe/Amsterdam. Gebruik voor tijdsverwijzingen in berichten ('over 3 uur', 'morgen') altijd de actuele tijd uit de Nu:-regel in toolresultaten of get_current_time — nooit een aanname. " +
+        "Conventies in output: berichtlijsten zijn chronologisch (oudste eerst) met dagkoppen '— wo 2026-07-02 —' en regels '[21:53] Afzender: tekst'; " +
+        "kale nummers zijn telefoonnummers (@s.whatsapp.net weggelaten), @g.us is een groep, @lid is een intern id (geen telefoonnummer); " +
+        "'…[+N tekens; full_text=true]' betekent dat een bericht is afgekapt — herhaal de call met full_text=true voor de volledige tekst.",
     }
   );
   registerTools(server);

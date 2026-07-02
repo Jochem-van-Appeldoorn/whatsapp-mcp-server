@@ -16,26 +16,40 @@ const IMAGE_MIME_TYPES: Record<string, string> = {
 };
 
 const TZ = "Europe/Amsterdam";
+const MAX_BODY_CHARS = 400;
+const MAX_AMBIGUOUS_CANDIDATES = 8;
 
-// sv-SE levert "2026-07-02 14:35" (ISO-achtig, 24-uurs), altijd in TZ —
-// onafhankelijk van de systeem-tijdzone waar de server draait.
-const timestampFmt = new Intl.DateTimeFormat("sv-SE", {
+// sv-SE levert ISO-achtige datums ("2026-07-02") en 24-uurs tijden, altijd in
+// TZ — onafhankelijk van de systeem-tijdzone waar de server draait.
+const dateFmt = new Intl.DateTimeFormat("sv-SE", {
   timeZone: TZ,
   year: "numeric",
   month: "2-digit",
   day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
 });
-const weekdayFmt = new Intl.DateTimeFormat("nl-NL", { timeZone: TZ, weekday: "long" });
+const clockFmt = new Intl.DateTimeFormat("sv-SE", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+const weekdayShortFmt = new Intl.DateTimeFormat("nl-NL", { timeZone: TZ, weekday: "short" });
+const weekdayLongFmt = new Intl.DateTimeFormat("nl-NL", { timeZone: TZ, weekday: "long" });
+
+function fmtDate(epochMs: number): string {
+  return dateFmt.format(new Date(epochMs));
+}
+
+function fmtClock(epochMs: number): string {
+  return clockFmt.format(new Date(epochMs));
+}
 
 function fmtTime(epochMs: number): string {
-  return timestampFmt.format(new Date(epochMs));
+  return `${fmtDate(epochMs)} ${fmtClock(epochMs)}`;
+}
+
+function dayHeader(epochMs: number): string {
+  return `— ${weekdayShortFmt.format(new Date(epochMs))} ${fmtDate(epochMs)} —`;
 }
 
 function nowLine(): string {
   const now = Date.now();
-  return `Nu: ${weekdayFmt.format(now)} ${fmtTime(now)} (${TZ})`;
+  return `Nu: ${weekdayShortFmt.format(now)} ${fmtTime(now)}`;
 }
 
 function text(body: string) {
@@ -46,6 +60,19 @@ function error(message: string) {
   return { content: [{ type: "text" as const, text: message }], isError: true as const };
 }
 
+// Toon telefoonnummer-JIDs als kaal nummer; @g.us/@lid (en shortcodes)
+// blijven intact omdat die niet als nummer terug te resolven zijn.
+function displayJid(jid: string): string {
+  const [user, server] = jid.split("@");
+  if (server === "s.whatsapp.net" && /^\d{8,}$/.test(user)) return user;
+  return jid;
+}
+
+function targetLabel(name: string | null, jid: string): string {
+  const id = displayJid(jid);
+  return name && name !== id ? `${name} (${id})` : id;
+}
+
 function requireResolved(
   result: ResolveResult
 ): { ok: true; jid: string; name: string | null } | { ok: false; response: ReturnType<typeof error> } {
@@ -53,12 +80,14 @@ function requireResolved(
   if (result.type === "not_found") {
     return { ok: false, response: error("Geen contact/chat gevonden voor deze zoekopdracht.") };
   }
+  const shown = result.candidates.slice(0, MAX_AMBIGUOUS_CANDIDATES);
+  const more = result.candidates.length - shown.length;
   return {
     ok: false,
     response: error(
-      `Meerdere mogelijke matches gevonden, wees specifieker of gebruik een JID/nummer:\n${result.candidates
-        .map((c) => `- ${c.name ?? "(onbekend)"} (${c.jid})`)
-        .join("\n")}`
+      `Meerdere matches, wees specifieker of gebruik een JID/nummer:\n${shown
+        .map((c) => `- ${c.name ?? "(onbekend)"} (${displayJid(c.jid)})`)
+        .join("\n")}${more > 0 ? `\n… en ${more} meer` : ""}`
     ),
   };
 }
@@ -75,14 +104,37 @@ function snippet(value: string | null, max = 80): string {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
+// Kapt lange berichtteksten af; bij een zoekopdracht wordt het venster rond
+// de eerste match gecentreerd zodat de hit-tekst zichtbaar blijft.
+function truncateBody(body: string, query?: string): string {
+  if (body.length <= MAX_BODY_CHARS) return body;
+  let start = 0;
+  if (query) {
+    const idx = body.toLowerCase().indexOf(query.toLowerCase());
+    if (idx >= 0) start = Math.max(0, Math.min(idx - Math.floor(MAX_BODY_CHARS / 2), body.length - MAX_BODY_CHARS));
+  }
+  const hidden = body.length - MAX_BODY_CHARS;
+  return `${start > 0 ? "…" : ""}${body.slice(start, start + MAX_BODY_CHARS)}…[+${hidden} tekens; full_text=true]`;
+}
+
 function senderName(msg: db.MessageRow): string {
   return msg.from_me ? "Jij" : db.getDisplayName(msg.sender || msg.chat_jid);
 }
 
-// Eén bericht als compacte regel: "[2026-07-02 14:35] Afzender: tekst".
-// Bericht-IDs alleen op verzoek (withId) of bij media, waar het ID nodig is
-// voor download_media — IDs zijn lang en meestal irrelevant.
-function msgLine(msg: db.MessageRow, opts: { withChat?: boolean; withId?: boolean } = {}): string {
+interface MsgLineOpts {
+  withChat?: boolean;
+  withId?: boolean;
+  withDate?: boolean;
+  fullText?: boolean;
+  query?: string;
+}
+
+// Eén bericht als compacte regel: "[21:53] Afzender: tekst". De datum komt
+// uit dagkoppen (renderMessages); withDate is voor losstaande regels.
+// Bericht-IDs alleen op verzoek of bij media, waar het ID nodig is voor
+// download_media — IDs zijn lang en meestal irrelevant.
+function msgLine(msg: db.MessageRow, opts: MsgLineOpts = {}): string {
+  const stamp = opts.withDate ? fmtTime(msg.timestamp) : fmtClock(msg.timestamp);
   const chatPart = opts.withChat ? ` {${db.getDisplayName(msg.chat_jid)}}` : "";
   let meta = "";
   if (msg.type !== "text") {
@@ -90,11 +142,31 @@ function msgLine(msg: db.MessageRow, opts: { withChat?: boolean; withId?: boolea
   } else if (opts.withId) {
     meta = ` <id=${msg.id}>`;
   }
-  return `[${fmtTime(msg.timestamp)}]${chatPart} ${senderName(msg)}: ${msg.text ?? ""}${meta}`;
+  const body = msg.text ? (opts.fullText ? msg.text : truncateBody(msg.text, opts.query)) : "";
+  return `[${stamp}]${chatPart} ${senderName(msg)}: ${body}${meta}`;
+}
+
+// Chronologische lijst met een dagkop bij elke datumwissel; anchorId markeert
+// het ankerbericht van get_message_context met ">>>".
+function renderMessages(messages: db.MessageRow[], opts: MsgLineOpts & { anchorId?: string } = {}): string {
+  const lines: string[] = [];
+  let currentDay = "";
+  for (const msg of messages) {
+    const day = fmtDate(msg.timestamp);
+    if (day !== currentDay) {
+      currentDay = day;
+      lines.push(dayHeader(msg.timestamp));
+    }
+    const line = msgLine(msg, opts);
+    lines.push(opts.anchorId && msg.id === opts.anchorId ? `>>> ${line}` : line);
+  }
+  return lines.join("\n");
 }
 
 function chatLine(chat: db.ChatRow): string {
-  return `${db.getDisplayName(chat.jid)}${chat.is_group ? " (groep)" : ""} — ${chat.jid}`;
+  const name = db.getDisplayName(chat.jid);
+  const id = displayJid(chat.jid);
+  return `${name}${chat.is_group ? " (groep)" : ""}${id !== name ? ` — ${id}` : ""}`;
 }
 
 function lastMessageSummary(msg: db.MessageRow): string {
@@ -107,56 +179,58 @@ export function registerTools(server: McpServer): void {
     "get_current_time",
     {
       description:
-        "Actuele datum en tijd (Europe/Amsterdam). Roep dit aan vóór je een bericht schrijft met een tijdsverwijzing ('over 3 uur', 'morgenmiddag') of een tijdsverschil uitrekent.",
+        "Actuele datum en tijd (Europe/Amsterdam). Aanroepen vóór je een bericht schrijft met een tijdsverwijzing ('over 3 uur', 'morgenmiddag').",
       inputSchema: {},
     },
-    async () => text(`${nowLine()}\nISO (UTC): ${new Date().toISOString()}`)
+    async () => {
+      const now = Date.now();
+      return text(`Nu: ${weekdayLongFmt.format(now)} ${fmtTime(now)} (${TZ})\nISO (UTC): ${new Date(now).toISOString()}`);
+    }
   );
 
   server.registerTool(
     "send_message",
     {
       description:
-        "Stuur een WhatsApp-tekstbericht. 'to' mag naam, nummer of JID zijn; namen worden automatisch opgezocht (search_contacts vooraf is onnodig). Noem je een tijdstip in de tekst, bepaal dat dan vanuit get_current_time of een 'Nu:'-regel, niet uit je hoofd.",
+        "Stuur een WhatsApp-tekstbericht. 'to' mag naam, nummer of JID zijn; namen worden automatisch opgezocht (search_contacts vooraf is onnodig). Tijdstip in de tekst? Bepaal dat via get_current_time of een Nu:-regel, niet uit je hoofd.",
       inputSchema: {
-        to: z.string().describe("Naam, telefoonnummer of JID van de ontvanger"),
-        text: z.string().describe("De berichttekst"),
+        to: z.string(),
+        text: z.string(),
       },
     },
     async ({ to, text: body }) => {
       const resolved = requireResolved(resolveChatTarget(to));
       if (!resolved.ok) return resolved.response;
       await getSocket().sendMessage(resolved.jid, { text: body });
-      return text(`Verzonden aan ${resolved.name ?? resolved.jid} (${resolved.jid}) om ${fmtTime(Date.now())}.`);
+      return text(`Verzonden aan ${targetLabel(resolved.name, resolved.jid)} om ${fmtTime(Date.now())}.`);
     }
   );
 
   server.registerTool(
     "send_file",
     {
-      description: "Stuur een afbeelding, video of document naar een contact of groep (lokaal pad of URL).",
+      description: "Stuur een afbeelding, video of document naar een contact of groep.",
       inputSchema: {
-        to: z.string().describe("Naam, telefoonnummer of JID van de ontvanger"),
-        source: z.string().describe("Lokaal bestandspad of URL"),
-        caption: z.string().optional().describe("Optioneel bijschrift"),
+        to: z.string().describe("Naam, nummer of JID"),
+        source: z.string().describe("Lokaal pad of URL"),
+        caption: z.string().optional(),
       },
     },
     async ({ to, source, caption }) => {
       const resolved = requireResolved(resolveChatTarget(to));
       if (!resolved.ok) return resolved.response;
       await media.sendFile(resolved.jid, source, caption);
-      return text(`Bestand verzonden aan ${resolved.name ?? resolved.jid} (${resolved.jid}): ${source}`);
+      return text(`Bestand verzonden aan ${targetLabel(resolved.name, resolved.jid)}: ${source}`);
     }
   );
 
   server.registerTool(
     "send_audio_message",
     {
-      description:
-        "Stuur audio als WhatsApp voice message (ptt). Converteert automatisch naar ogg/opus met ffmpeg indien nodig en beschikbaar.",
+      description: "Stuur audio als WhatsApp voice message (ptt); converteert zo nodig via ffmpeg naar ogg/opus.",
       inputSchema: {
-        to: z.string().describe("Naam, telefoonnummer of JID van de ontvanger"),
-        source: z.string().describe("Lokaal bestandspad of URL naar het audiobestand"),
+        to: z.string().describe("Naam, nummer of JID"),
+        source: z.string().describe("Lokaal pad of URL"),
       },
     },
     async ({ to, source }) => {
@@ -164,9 +238,7 @@ export function registerTools(server: McpServer): void {
       if (!resolved.ok) return resolved.response;
       const result = await media.sendVoiceMessage(resolved.jid, source);
       const kind = result.sentAsVoiceNote ? "Voice-bericht" : "Audiobestand";
-      return text(
-        `${kind} verzonden aan ${resolved.name ?? resolved.jid} (${resolved.jid}).${result.note ? `\n${result.note}` : ""}`
-      );
+      return text(`${kind} verzonden aan ${targetLabel(resolved.name, resolved.jid)}.${result.note ? `\n${result.note}` : ""}`);
     }
   );
 
@@ -174,10 +246,10 @@ export function registerTools(server: McpServer): void {
     "download_media",
     {
       description:
-        "Download media van een ontvangen bericht (bericht-ID staat in de <type id=...>-annotatie). Afbeeldingen worden direct getoond, overige media als bestandspad.",
+        "Download media van een ontvangen bericht (id staat in de <type id=...>-annotatie). Afbeeldingen worden direct getoond, overige media als bestandspad.",
       inputSchema: {
-        chat: z.string().describe("Naam, telefoonnummer of JID van de chat waarin het bericht staat"),
-        message_id: z.string().describe("Het bericht-ID van het mediabericht"),
+        chat: z.string().describe("Naam, nummer of JID"),
+        message_id: z.string(),
       },
     },
     async ({ chat, message_id }) => {
@@ -206,19 +278,18 @@ export function registerTools(server: McpServer): void {
     "search_contacts",
     {
       description: "Zoek contacten op naam of telefoonnummer.",
-      inputSchema: { query: z.string().describe("Zoekterm (deel van naam of nummer)") },
+      inputSchema: { query: z.string() },
     },
     async ({ query }) => {
       const rows = db.searchContacts(query);
       if (!rows.length) return text("Geen contacten gevonden.");
       return text(
         rows
-          .map(
-            (c) =>
-              `${c.name ?? "(onbekend)"} — ${c.jid}${
-                c.number && !c.jid.startsWith(`${c.number}@`) ? ` (nummer: ${c.number})` : ""
-              }`
-          )
+          .map((c) => {
+            const id = displayJid(c.jid);
+            const extra = c.number && id !== c.number && !c.jid.startsWith(`${c.number}@`) ? ` (nummer: ${c.number})` : "";
+            return `${c.name ?? "(onbekend)"} — ${id}${extra}`;
+          })
           .join("\n")
       );
     }
@@ -229,8 +300,8 @@ export function registerTools(server: McpServer): void {
     {
       description: "Toon recente chats (1-op-1 en groepen) met laatste bericht.",
       inputSchema: {
-        limit: z.number().int().positive().max(200).optional().describe("Maximum aantal chats (standaard 20)"),
-        include_groups: z.boolean().optional().describe("Groepen meenemen (standaard true)"),
+        limit: z.number().int().positive().max(200).optional().describe("standaard 20"),
+        include_groups: z.boolean().optional().describe("standaard true"),
       },
     },
     async ({ limit, include_groups }) => {
@@ -248,22 +319,20 @@ export function registerTools(server: McpServer): void {
     "list_messages",
     {
       description:
-        "Zoek/filter berichten. Zonder 'chat' wordt over alle chats gezocht ({chatnaam} per regel). Datums als ISO-string (bv. 2026-07-01).",
+        "Zoek/filter berichten; zonder 'chat' wordt over alle chats gezocht ({chatnaam} per regel). Datums als ISO-string (bv. 2026-07-01).",
       inputSchema: {
-        chat: z.string().optional().describe("Naam, telefoonnummer of JID om tot één chat te beperken"),
-        query: z.string().optional().describe("Tekst om op te zoeken in berichten"),
-        sender: z.string().optional().describe("JID van de afzender om op te filteren"),
-        date_from: z.string().optional().describe("ISO-datum, alleen berichten vanaf hier"),
-        date_to: z.string().optional().describe("ISO-datum, alleen berichten tot hier"),
-        is_from_me: z.boolean().optional().describe("Alleen eigen (true) of ontvangen (false) berichten"),
-        limit: z.number().int().positive().max(500).optional().describe("Maximum aantal berichten (standaard 20)"),
-        include_ids: z
-          .boolean()
-          .optional()
-          .describe("Toon bericht-IDs (nodig voor get_message_context/download_media; standaard false)"),
+        chat: z.string().optional().describe("Beperk tot één chat (naam, nummer of JID)"),
+        query: z.string().optional().describe("Zoektekst"),
+        sender: z.string().optional().describe("Afzender-JID"),
+        date_from: z.string().optional(),
+        date_to: z.string().optional(),
+        is_from_me: z.boolean().optional().describe("true=eigen, false=ontvangen"),
+        limit: z.number().int().positive().max(500).optional().describe("standaard 20"),
+        include_ids: z.boolean().optional().describe("Toon bericht-IDs (voor get_message_context/download_media)"),
+        full_text: z.boolean().optional().describe(`Geen afkapping op ${MAX_BODY_CHARS} tekens`),
       },
     },
-    async ({ chat, query, sender, date_from, date_to, is_from_me, limit, include_ids }) => {
+    async ({ chat, query, sender, date_from, date_to, is_from_me, limit, include_ids, full_text }) => {
       let chatJid: string | undefined;
       if (chat) {
         const resolved = requireResolved(resolveChatTarget(chat));
@@ -283,10 +352,15 @@ export function registerTools(server: McpServer): void {
         .reverse(); // chronologisch, oudste eerst
       if (!messages.length) return text(`${nowLine()}\nGeen berichten gevonden.`);
       const header = chatJid
-        ? `Chat: ${db.getDisplayName(chatJid)} (${chatJid}) — ${messages.length} berichten, oudste eerst`
-        : `${messages.length} berichten uit meerdere chats, oudste eerst`;
-      const lines = messages.map((m) => msgLine(m, { withChat: !chatJid, withId: include_ids ?? false }));
-      return text(`${nowLine()}\n${header}\n${lines.join("\n")}`);
+        ? `Chat: ${targetLabel(db.getDisplayName(chatJid), chatJid)} — ${messages.length} berichten`
+        : `${messages.length} berichten uit meerdere chats`;
+      const body = renderMessages(messages, {
+        withChat: !chatJid,
+        withId: include_ids ?? false,
+        fullText: full_text ?? false,
+        query,
+      });
+      return text(`${nowLine()}\n${header}\n${body}`);
     }
   );
 
@@ -295,25 +369,25 @@ export function registerTools(server: McpServer): void {
     {
       description: "Haal berichten rond een specifiek bericht op (voor/na), om conversatiecontext te zien.",
       inputSchema: {
-        chat: z.string().describe("Naam, telefoonnummer of JID van de chat"),
-        message_id: z.string().describe("Het bericht-ID waar rond gezocht wordt"),
-        before: z.number().int().min(0).max(50).optional().describe("Aantal berichten ervoor (standaard 5)"),
-        after: z.number().int().min(0).max(50).optional().describe("Aantal berichten erna (standaard 5)"),
+        chat: z.string().describe("Naam, nummer of JID"),
+        message_id: z.string(),
+        before: z.number().int().min(0).max(50).optional().describe("standaard 5"),
+        after: z.number().int().min(0).max(50).optional().describe("standaard 5"),
+        include_ids: z.boolean().optional().describe("Toon bericht-IDs"),
+        full_text: z.boolean().optional().describe(`Geen afkapping op ${MAX_BODY_CHARS} tekens`),
       },
     },
-    async ({ chat, message_id, before, after }) => {
+    async ({ chat, message_id, before, after, include_ids, full_text }) => {
       const resolved = requireResolved(resolveChatTarget(chat));
       if (!resolved.ok) return resolved.response;
       const context = db.getMessageContext(resolved.jid, message_id, before, after);
       if (!context) return error("Bericht niet gevonden in de lokale geschiedenis.");
-      const lines = [
-        ...context.before.map((m) => msgLine(m, { withId: true })),
-        `>>> ${msgLine(context.message, { withId: true })}`,
-        ...context.after.map((m) => msgLine(m, { withId: true })),
-      ];
-      return text(
-        `${nowLine()}\nChat: ${db.getDisplayName(resolved.jid)} (${resolved.jid}), oudste eerst\n${lines.join("\n")}`
-      );
+      const body = renderMessages([...context.before, context.message, ...context.after], {
+        withId: include_ids ?? false,
+        fullText: full_text ?? false,
+        anchorId: context.message.id,
+      });
+      return text(`${nowLine()}\nChat: ${targetLabel(db.getDisplayName(resolved.jid), resolved.jid)}\n${body}`);
     }
   );
 
@@ -321,14 +395,14 @@ export function registerTools(server: McpServer): void {
     "get_last_interaction",
     {
       description: "Haal het meest recente bericht met een contact of groep op.",
-      inputSchema: { contact: z.string().describe("Naam, telefoonnummer of JID") },
+      inputSchema: { contact: z.string().describe("Naam, nummer of JID") },
     },
     async ({ contact }) => {
       const resolved = requireResolved(resolveChatTarget(contact));
       if (!resolved.ok) return resolved.response;
       const last = db.getLastInteraction(resolved.jid);
-      if (!last) return text(`${nowLine()}\nGeen berichten met ${resolved.name ?? resolved.jid}.`);
-      return text(`${nowLine()}\n${msgLine(last, { withChat: true, withId: true })}`);
+      if (!last) return text(`${nowLine()}\nGeen berichten met ${targetLabel(resolved.name, resolved.jid)}.`);
+      return text(`${nowLine()}\n${msgLine(last, { withChat: true, withId: true, withDate: true, fullText: true })}`);
     }
   );
 
@@ -336,12 +410,12 @@ export function registerTools(server: McpServer): void {
     "get_direct_chat_by_contact",
     {
       description: "Vind het 1-op-1 gesprek met een specifiek contact.",
-      inputSchema: { contact: z.string().describe("Naam, telefoonnummer of JID") },
+      inputSchema: { contact: z.string().describe("Naam, nummer of JID") },
     },
     async ({ contact }) => {
       const resolved = requireResolved(resolveChatTarget(contact, { directOnly: true }));
       if (!resolved.ok) return resolved.response;
-      return text(`${db.getDisplayName(resolved.jid)} — ${resolved.jid}`);
+      return text(targetLabel(db.getDisplayName(resolved.jid), resolved.jid));
     }
   );
 
@@ -349,7 +423,7 @@ export function registerTools(server: McpServer): void {
     "get_contact_chats",
     {
       description: "Lijst alle chats (1-op-1 en groepen) waarin dit contact voorkomt.",
-      inputSchema: { contact: z.string().describe("Naam, telefoonnummer of JID") },
+      inputSchema: { contact: z.string().describe("Naam, nummer of JID") },
     },
     async ({ contact }) => {
       const resolved = requireResolved(resolveChatTarget(contact, { directOnly: true }));
@@ -374,20 +448,30 @@ export function registerTools(server: McpServer): void {
     "get_group_info",
     {
       description: "Haal live groepsinformatie op: leden, admins, omschrijving.",
-      inputSchema: { group: z.string().describe("Naam of JID van de groep") },
+      inputSchema: {
+        group: z.string().describe("Naam of JID van de groep"),
+        include_jids: z.boolean().optional().describe("Toon leden-JIDs (standaard false)"),
+        members_limit: z.number().int().positive().optional().describe("standaard 100"),
+      },
     },
-    async ({ group }) => {
+    async ({ group, include_jids, members_limit }) => {
       const resolved = requireResolved(resolveChatTarget(group, { groupOnly: true }));
       if (!resolved.ok) return resolved.response;
       try {
         const metadata = await getSocket().groupMetadata(resolved.jid);
+        const limit = members_limit ?? 100;
+        const participants = metadata.participants;
+        const names = participants
+          .slice(0, limit)
+          .map(
+            (p) =>
+              `${db.getDisplayName(p.id)}${include_jids ? ` (${displayJid(p.id)})` : ""}${p.admin ? ` [${p.admin}]` : ""}`
+          );
+        const overflow = participants.length > limit ? ` (+${participants.length - limit} meer)` : "";
         const lines = [
           `${metadata.subject} — ${resolved.jid}`,
           ...(metadata.desc ? [`Omschrijving: ${snippet(metadata.desc, 200)}`] : []),
-          `${metadata.participants.length} leden:`,
-          ...metadata.participants.map(
-            (p) => `- ${db.getDisplayName(p.id)} (${p.id})${p.admin ? ` [${p.admin}]` : ""}`
-          ),
+          `Leden (${participants.length}): ${names.join(", ")}${overflow}`,
         ];
         return text(lines.join("\n"));
       } catch (err) {
@@ -400,19 +484,11 @@ export function registerTools(server: McpServer): void {
     "get_unanswered_messages",
     {
       description:
-        "Toon 1-op-1 chats waarvan het laatste inkomende bericht langer dan de drempel onbeantwoord is. Filtert standaard op vraag-achtige berichten en negeert chats ouder dan max_age_days.",
+        "1-op-1 chats waarvan het laatste inkomende bericht langer dan de drempel onbeantwoord is; filtert standaard op vraag-achtige berichten.",
       inputSchema: {
-        threshold_minutes: z.number().int().positive().optional().describe("Drempel in minuten (standaard 30)"),
-        max_age_days: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe("Negeer chats waarvan het laatste bericht ouder is dan dit (standaard 30 dagen)"),
-        require_question: z
-          .boolean()
-          .optional()
-          .describe("Alleen berichten die op een vraag lijken meetellen (standaard true)"),
+        threshold_minutes: z.number().int().positive().optional().describe("standaard 30"),
+        max_age_days: z.number().int().positive().optional().describe("standaard 30"),
+        require_question: z.boolean().optional().describe("standaard true"),
       },
     },
     async ({ threshold_minutes, max_age_days, require_question }) => {
@@ -420,7 +496,7 @@ export function registerTools(server: McpServer): void {
       if (!chats.length) return text(`${nowLine()}\nGeen onbeantwoorde berichten.`);
       const lines = chats.map((c) => {
         const last = db.getLastInteraction(c.jid);
-        return `${db.getDisplayName(c.jid)} (${c.jid})${
+        return `${targetLabel(db.getDisplayName(c.jid), c.jid)}${
           last ? ` — [${fmtTime(last.timestamp)}] ${snippet(last.text, 100)}` : ""
         }`;
       });
