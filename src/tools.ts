@@ -310,7 +310,7 @@ export function registerTools(server: McpServer): void {
     "get_unanswered_messages",
     {
       description:
-        "Toon 1-op-1 chats waarin het laatste bericht inkomend is en al langer dan de drempel onbeantwoord staat (groepen worden genegeerd). Chats waarvan het laatste bericht ouder is dan max_age_days worden als niet meer relevant beschouwd en weggelaten (anders domineren jarenoude, allang dode gesprekken de resultaten).",
+        "Toon 1-op-1 chats waarin het laatste bericht inkomend is en al langer dan de drempel onbeantwoord staat (groepen worden genegeerd). Chats waarvan het laatste bericht ouder is dan max_age_days worden als niet meer relevant beschouwd en weggelaten. Standaard worden ook berichten weggefilterd die er niet als een vraag uitzien (bv. 'oke doei', '👍') zodat afgeronde gesprekken niet blijven terugkomen.",
       inputSchema: {
         threshold_minutes: z.number().int().positive().optional().describe("Drempel in minuten (standaard 30)"),
         max_age_days: z
@@ -319,10 +319,18 @@ export function registerTools(server: McpServer): void {
           .positive()
           .optional()
           .describe("Negeer chats waarvan het laatste bericht ouder is dan dit (standaard 30 dagen)"),
+        require_question: z
+          .boolean()
+          .optional()
+          .describe("Alleen berichten die op een vraag lijken meetellen (standaard true)"),
       },
     },
-    async ({ threshold_minutes, max_age_days }) =>
-      json(db.getUnansweredChats(threshold_minutes ?? 30, max_age_days ?? 30).map(formatChat))
+    async ({ threshold_minutes, max_age_days, require_question }) =>
+      json(
+        db
+          .getUnansweredChats(threshold_minutes ?? 30, max_age_days ?? 30, require_question ?? true)
+          .map(formatChat)
+      )
   );
 
   server.registerTool(

@@ -225,24 +225,47 @@ export function getDisplayName(jid: string): string {
   return jid.split("@")[0];
 }
 
-export function getUnansweredChats(thresholdMinutes: number, maxAgeDays = 30): ChatRow[] {
+// Dutch/English question starters, used to filter out "conversation just
+// ended" messages (e.g. "oke doei", "haha", "👍") that don't actually need
+// a reply, so reminders only fire for things that look like open questions.
+const QUESTION_STARTERS = [
+  "wat", "wanneer", "waar", "wie", "hoe", "waarom", "welke", "welk",
+  "kun je", "kan je", "kunnen jullie", "kunnen we", "wil je", "willen jullie",
+  "zou je", "zouden jullie", "heb je", "hebben jullie", "ga je", "gaan jullie",
+  "mag ik", "mogen we", "is het", "is er", "zijn er", "weet je", "vind je",
+  "denk je", "lukt het", "what", "when", "where", "who", "how", "why",
+  "which", "can you", "could you", "would you", "do you", "did you",
+  "are you", "is it", "have you", "will you", "should",
+];
+
+function looksLikeQuestion(text: string | null): boolean {
+  if (!text) return false;
+  const t = text.trim().toLowerCase();
+  if (t.length < 2) return false;
+  if (t.includes("?")) return true;
+  return QUESTION_STARTERS.some((w) => t === w || t.startsWith(`${w} `) || t.includes(` ${w} `));
+}
+
+export function getUnansweredChats(thresholdMinutes: number, maxAgeDays = 30, requireQuestion = true): ChatRow[] {
   const now = Date.now();
   const cutoff = now - thresholdMinutes * 60_000;
   const minTs = now - maxAgeDays * 24 * 60 * 60_000;
-  return db
+  const candidates = db
     .prepare(
-      `SELECT c.* FROM chats c
+      `SELECT c.jid, c.name, c.is_group, c.last_message_ts, c.last_notified_ts, m.text AS last_text
+       FROM chats c
+       JOIN messages m ON m.chat_jid = c.jid AND m.timestamp = c.last_message_ts AND m.from_me = 0
        WHERE c.is_group = 0
          AND c.last_message_ts IS NOT NULL
          AND c.last_message_ts <= @cutoff
          AND c.last_message_ts >= @minTs
-         AND EXISTS (
-           SELECT 1 FROM messages m
-           WHERE m.chat_jid = c.jid AND m.timestamp = c.last_message_ts AND m.from_me = 0
-         )
        ORDER BY c.last_message_ts ASC`
     )
-    .all({ cutoff, minTs }) as ChatRow[];
+    .all({ cutoff, minTs }) as (ChatRow & { last_text: string | null })[];
+
+  return candidates
+    .filter((c) => !requireQuestion || looksLikeQuestion(c.last_text))
+    .map(({ last_text, ...chat }) => chat);
 }
 
 export function markChatNotified(jid: string, ts: number) {
