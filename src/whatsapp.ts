@@ -115,6 +115,9 @@ export async function connectWhatsApp(): Promise<void> {
     logger,
     printQRInTerminal: false,
     browser: ["whatsapp-mcp-server", "Chrome", "1.0.0"],
+    // Anders staat het account permanent "online" zolang de server draait,
+    // en onderdrukt WhatsApp pushmeldingen naar de telefoon.
+    markOnlineOnConnect: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
