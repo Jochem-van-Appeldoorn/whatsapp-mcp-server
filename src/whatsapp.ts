@@ -16,12 +16,34 @@ import { insertMessage, upsertContact, upsertChat, upsertMediaMessage, getMediaM
 
 const MEDIA_TYPES = new Set(["image", "video", "audio", "document", "sticker"]);
 
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_MAX_MS = 60_000;
+const CONNECT_WAIT_MS = 45_000;
+
+const HANDLED_EVENTS = [
+  "creds.update",
+  "connection.update",
+  "messages.upsert",
+  "messaging-history.set",
+  "contacts.upsert",
+] as const;
+
 const logger = pino({ level: "silent" });
 
 let sock: WASocket | undefined;
 let connectionState: "connecting" | "open" | "closed" = "connecting";
 let linkedNumber: string | undefined;
 let lastConnectedAt: number | undefined;
+
+// Elke socket krijgt een eigen epoch. Alleen de socket die nog de actuele is mag
+// een reconnect starten; events van een afgedankte socket worden genegeerd.
+let socketEpoch = 0;
+let reconnectAttempts = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+
+function log(message: string) {
+  console.log(`${new Date().toISOString()} ${message}`);
+}
 
 export function getStatus() {
   return { connectionState, linkedNumber, lastConnectedAt };
@@ -30,6 +52,50 @@ export function getStatus() {
 export function getSocket(): WASocket {
   if (!sock) throw new Error("WhatsApp socket not initialized yet");
   return sock;
+}
+
+// Wacht tot de verbinding open is. Zonder deze gate stuurt een send naar een
+// socket die net wegvalt, en blijft die call hangen tot de media-upload opgeeft.
+export async function waitUntilConnected(timeoutMs = CONNECT_WAIT_MS): Promise<WASocket> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (sock && connectionState === "open") return sock;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`WhatsApp-verbinding is niet open (status: ${connectionState}) na ${Math.round(timeoutMs / 1000)}s wachten.`);
+}
+
+// Zonder expliciete teardown blijft een afgedankte socket zijn keep-alive-timer
+// draaien, time-outen met code 408, en via zijn nog aangehechte listener een
+// nieuwe socket starten. Dat vermenigvuldigt zich per ronde.
+async function teardownSocket(target: WASocket | undefined) {
+  if (!target) return;
+  for (const event of HANDLED_EVENTS) {
+    try {
+      target.ev.removeAllListeners(event);
+    } catch {
+      // listener was er al niet meer
+    }
+  }
+  try {
+    await target.end(undefined);
+  } catch {
+    // socket lag al plat
+  }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
+  reconnectAttempts += 1;
+  log(`Herverbinden over ${Math.round(delay / 1000)}s (poging ${reconnectAttempts}).`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = undefined;
+    connectWhatsApp().catch((err) => {
+      log(`Reconnect mislukt: ${err instanceof Error ? err.message : String(err)}`);
+      scheduleReconnect();
+    });
+  }, delay);
 }
 
 function extractText(msg: proto.IWebMessageInfo): string | null {
@@ -106,10 +172,20 @@ export async function downloadMessageMedia(msg: proto.IWebMessageInfo): Promise<
 }
 
 export async function connectWhatsApp(): Promise<void> {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+  }
+  await teardownSocket(sock);
+  sock = undefined;
+
+  const epoch = ++socketEpoch;
+  connectionState = "connecting";
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
+  const current = makeWASocket({
     version,
     auth: state,
     logger,
@@ -118,11 +194,16 @@ export async function connectWhatsApp(): Promise<void> {
     // Anders staat het account permanent "online" zolang de server draait,
     // en onderdrukt WhatsApp pushmeldingen naar de telefoon.
     markOnlineOnConnect: false,
+    keepAliveIntervalMs: 30_000,
+    connectTimeoutMs: 60_000,
+    defaultQueryTimeoutMs: 60_000,
   });
+  sock = current;
 
-  sock.ev.on("creds.update", saveCreds);
+  current.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", (update) => {
+  current.ev.on("connection.update", (update) => {
+    if (epoch !== socketEpoch) return;
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -135,30 +216,31 @@ export async function connectWhatsApp(): Promise<void> {
       rm(join(CONFIG_DIR, "qr.txt"), { force: true }).catch(() => {});
       connectionState = "open";
       lastConnectedAt = Date.now();
-      linkedNumber = sock?.user?.id?.split(":")[0];
-      console.log(`WhatsApp verbonden als ${linkedNumber}`);
+      reconnectAttempts = 0;
+      linkedNumber = current.user?.id?.split(":")[0];
+      log(`WhatsApp verbonden als ${linkedNumber}`);
     } else if (connection === "close") {
       connectionState = "closed";
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`WhatsApp-verbinding gesloten (code ${statusCode}). Herverbinden: ${shouldReconnect}`);
+      log(`WhatsApp-verbinding gesloten (code ${statusCode}). Herverbinden: ${shouldReconnect}`);
       if (shouldReconnect) {
-        connectWhatsApp().catch((err) => console.error("Reconnect mislukt:", err));
+        scheduleReconnect();
       } else {
-        console.error("Sessie uitgelogd. Verwijder de auth-map en scan opnieuw een QR-code.");
+        log("Sessie uitgelogd. Verwijder de auth-map en scan opnieuw een QR-code.");
       }
     } else if (connection === "connecting") {
       connectionState = "connecting";
     }
   });
 
-  sock.ev.on("messages.upsert", ({ messages }) => {
+  current.ev.on("messages.upsert", ({ messages }) => {
     for (const msg of messages) {
       handleIncomingMessage(msg).catch((err) => console.error("Fout bij verwerken bericht:", err));
     }
   });
 
-  sock.ev.on("messaging-history.set", ({ chats, contacts, messages }) => {
+  current.ev.on("messaging-history.set", ({ chats, contacts, messages }) => {
     for (const chat of chats) {
       if (!chat.id) continue;
       upsertChat(chat.id, chat.name ?? null, chat.id.endsWith("@g.us"), chat.conversationTimestamp ? Number(chat.conversationTimestamp) * 1000 : null);
@@ -171,7 +253,7 @@ export async function connectWhatsApp(): Promise<void> {
     }
   });
 
-  sock.ev.on("contacts.upsert", (contacts) => {
+  current.ev.on("contacts.upsert", (contacts) => {
     for (const contact of contacts) {
       if (contact.id) upsertContact(contact.id, contact.name ?? contact.notify ?? null, contact.id.split("@")[0] ?? null);
     }
