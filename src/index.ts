@@ -1,12 +1,31 @@
+import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { connectWhatsApp } from "./whatsapp.js";
 import { registerTools } from "./tools.js";
 import { startReminders } from "./reminders.js";
+import { MCP_TOKEN_PATH } from "./paths.js";
 
 const PORT = Number(process.env.WHATSAPP_MCP_PORT ?? 8765);
 const REMINDER_THRESHOLD_MINUTES = Number(process.env.WHATSAPP_MCP_REMINDER_MINUTES ?? 30);
+
+// De server wordt via Tailscale Funnel publiek bereikbaar gemaakt (voor de
+// Marktplaats cloud-routine), dus een bearer-token is verplicht: zonder
+// deze check zou iedereen die de URL raadt WhatsApp-berichten kunnen lezen
+// of versturen namens Jochem. Token wordt eenmalig gegenereerd en
+// hergebruikt bij herstarts.
+function getOrCreateAuthToken(): string {
+  if (existsSync(MCP_TOKEN_PATH)) {
+    return readFileSync(MCP_TOKEN_PATH, "utf8").trim();
+  }
+  const token = randomBytes(32).toString("hex");
+  writeFileSync(MCP_TOKEN_PATH, token, { mode: 0o600 });
+  return token;
+}
+
+const AUTH_TOKEN = getOrCreateAuthToken();
 
 function createServer(): McpServer {
   const server = new McpServer(
@@ -28,6 +47,16 @@ async function main() {
   startReminders(REMINDER_THRESHOLD_MINUTES);
 
   const app = createMcpExpressApp();
+
+  app.use("/mcp", (req, res, next) => {
+    const header = req.header("authorization") ?? "";
+    const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (provided !== AUTH_TOKEN) {
+      res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
+      return;
+    }
+    next();
+  });
 
   app.post("/mcp", async (req, res) => {
     try {
