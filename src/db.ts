@@ -40,6 +40,16 @@ db.exec(`
   );
 `);
 
+// Opruimen van rijen die er nooit hadden mogen staan: groep-JIDs in de contactenlijst. Die zijn
+// ontstaan doordat de pushName van een afzender werd opgeslagen onder het JID van het gesprek in
+// plaats van dat van de afzender (zie whatsapp.ts). Een groep is geen contactpersoon, en de naam
+// die erin stond was die van wie er als laatste sprak - niet te herstellen, dus weg ermee. De
+// contactenlijst wordt sowieso opnieuw gevuld uit binnenkomende berichten en de contactsync.
+const opgeruimd = db.prepare(`DELETE FROM contacts WHERE jid LIKE '%@g.us'`).run();
+if (opgeruimd.changes > 0) {
+  console.error(`[db] ${opgeruimd.changes} groep-JIDs uit de contactenlijst verwijderd`);
+}
+
 export interface ChatRow {
   jid: string;
   name: string | null;
@@ -204,8 +214,14 @@ export function getChatsForSender(jid: string): ChatRow[] {
 
 export function searchContacts(query: string): ContactRow[] {
   const like = `%${query}%`;
+  // Groepen horen hier niet tussen: zoeken op een persoonsnaam leverde anders een groep op waar
+  // die persoon toevallig het laatst had gesproken, en dat leest als een contactpersoon.
   return db
-    .prepare(`SELECT * FROM contacts WHERE name LIKE @like OR number LIKE @like ORDER BY name LIMIT 20`)
+    .prepare(
+      `SELECT * FROM contacts
+       WHERE (name LIKE @like OR number LIKE @like) AND jid NOT LIKE '%@g.us'
+       ORDER BY name LIMIT 20`
+    )
     .all({ like }) as ContactRow[];
 }
 
@@ -214,12 +230,51 @@ export function getContact(jid: string): ContactRow | undefined {
 }
 
 /**
+ * Voegt een chat die per ongeluk onder een oude/andere JID is opgeslagen (bv. een
+ * @lid-identiteit die achteraf bleek te herleiden naar een telefoonnummer-JID van
+ * dezelfde contactpersoon) samen met de canonieke JID, zodat berichtgeschiedenis niet
+ * over twee "chats" versplinterd blijft.
+ */
+export function mergeChatJid(oldJid: string, canonicalJid: string) {
+  if (oldJid === canonicalJid) return;
+  const oldChat = getChat(oldJid);
+  if (!oldChat) return;
+
+  upsertChat(canonicalJid, oldChat.name, oldChat.is_group === 1, oldChat.last_message_ts);
+
+  db.prepare(`UPDATE OR IGNORE messages SET chat_jid = ? WHERE chat_jid = ?`).run(canonicalJid, oldJid);
+  db.prepare(`UPDATE messages SET sender = ? WHERE sender = ?`).run(canonicalJid, oldJid);
+  db.prepare(`UPDATE OR IGNORE media_messages SET chat_jid = ? WHERE chat_jid = ?`).run(canonicalJid, oldJid);
+  // Restjes die niet konden verhuizen (id-botsing met de canonieke chat) opruimen
+  // in plaats van als wees onder de oude JID te laten hangen.
+  db.prepare(`DELETE FROM messages WHERE chat_jid = ?`).run(oldJid);
+  db.prepare(`DELETE FROM media_messages WHERE chat_jid = ?`).run(oldJid);
+  db.prepare(`DELETE FROM chats WHERE jid = ?`).run(oldJid);
+
+  const oldContact = getContact(oldJid);
+  if (oldContact) {
+    upsertContact(canonicalJid, oldContact.name, oldContact.number);
+    db.prepare(`DELETE FROM contacts WHERE jid = ?`).run(oldJid);
+  }
+}
+
+export function getAllLidChatJids(): string[] {
+  return (db.prepare(`SELECT jid FROM chats WHERE jid LIKE '%@lid'`).all() as { jid: string }[]).map((r) => r.jid);
+}
+
+/**
  * Best-effort display name for a JID: contact name, then chat name
  * (group subject), falling back to the bare phone number/id.
+ *
+ * A group is never a contact, so for group JIDs the contacts table is skipped
+ * entirely. It can hold a participant name for a group JID - older rows were
+ * written that way - and that name would otherwise hide the actual subject.
  */
 export function getDisplayName(jid: string): string {
-  const contact = getContact(jid);
-  if (contact?.name) return contact.name;
+  if (!jid.endsWith("@g.us")) {
+    const contact = getContact(jid);
+    if (contact?.name) return contact.name;
+  }
   const chat = getChat(jid);
   if (chat?.name) return chat.name;
   return jid.split("@")[0];
