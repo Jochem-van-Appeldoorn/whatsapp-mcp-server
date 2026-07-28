@@ -440,7 +440,42 @@ export function registerTools(server: McpServer): void {
     async () => {
       const groups = db.getGroups();
       if (!groups.length) return text("Geen groepen gevonden.");
-      return text(groups.map((g) => `${db.getDisplayName(g.jid)} — ${g.jid}`).join("\n"));
+
+      // Groepen waarvan het onderwerp nooit is binnengekomen staan met een lege naam in de
+      // database. Die zijn dan alleen aan hun JID te herkennen, en dus niet op naam te vinden.
+      // Haal ze hier eenmalig op; daarna staan ze opgeslagen en kost dit niets meer.
+      const zonderNaam = groups.filter((g) => !g.name);
+      let mislukt = 0;
+      if (zonderNaam.length) {
+        await Promise.all(
+          zonderNaam.map(async (g) => {
+            try {
+              const metadata = await getSocket().groupMetadata(g.jid);
+              if (metadata.subject) db.upsertChat(g.jid, metadata.subject, true, null);
+              else mislukt++;
+            } catch {
+              // Geen verbinding, of geen toegang tot deze groep.
+              mislukt++;
+            }
+          })
+        );
+      }
+
+      const vers = db.getGroups();
+      const regels = vers.map((g) => `${db.getDisplayName(g.jid)} — ${g.jid}`);
+
+      // Zwijg hier niet over. Een groep die als kaal nummer in de lijst staat lijkt anders een
+      // groep zonder naam, terwijl het onderwerp gewoon niet opgehaald kon worden - en juist dan
+      // ga je hem verkeerd zoeken.
+      if (mislukt > 0) {
+        regels.push(
+          "",
+          `Let op: van ${mislukt} groep(en) kon het onderwerp niet worden opgehaald; die staan hierboven ` +
+            `als kaal nummer. Meestal is de verbinding nog bezig (check_connection_status). Probeer opnieuw, ` +
+            `of haal er een gericht op met get_group_info op de JID.`
+        );
+      }
+      return text(regels.join("\n"));
     }
   );
 
@@ -459,6 +494,11 @@ export function registerTools(server: McpServer): void {
       if (!resolved.ok) return resolved.response;
       try {
         const metadata = await getSocket().groupMetadata(resolved.jid);
+
+        // Onthoud het onderwerp. Zonder dit bleef chats.name leeg, hoe vaak je deze tool ook
+        // aanriep, en begon elke nieuwe sessie weer zonder groepsnamen.
+        if (metadata.subject) db.upsertChat(resolved.jid, metadata.subject, true, null);
+
         const limit = members_limit ?? 100;
         const participants = metadata.participants;
         const names = participants
