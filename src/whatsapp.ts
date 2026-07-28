@@ -2,6 +2,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
+  jidNormalizedUser,
   DisconnectReason,
   proto,
   type WASocket,
@@ -12,7 +13,16 @@ import pino from "pino";
 import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { AUTH_DIR, DOWNLOADS_DIR, CONFIG_DIR } from "./paths.js";
-import { insertMessage, upsertContact, upsertChat, upsertMediaMessage, getMediaMessageRaw, type MessageRow } from "./db.js";
+import {
+  insertMessage,
+  upsertContact,
+  upsertChat,
+  upsertMediaMessage,
+  getMediaMessageRaw,
+  mergeChatJid,
+  getAllLidChatJids,
+  type MessageRow,
+} from "./db.js";
 
 const MEDIA_TYPES = new Set(["image", "video", "audio", "document", "sticker"]);
 
@@ -30,6 +40,38 @@ export function getStatus() {
 export function getSocket(): WASocket {
   if (!sock) throw new Error("WhatsApp socket not initialized yet");
   return sock;
+}
+
+/**
+ * WhatsApp adresseert dezelfde contactpersoon soms via een telefoonnummer-JID
+ * (@s.whatsapp.net) en soms via een interne @lid-identiteit (bv. gekoppelde/business
+ * apparaten). Zonder normalisatie versplintert één gesprek zo over twee "chats" in
+ * onze database. Herleid @lid altijd naar de telefoonnummer-JID wanneer die mapping
+ * bekend is, zodat alles in één chat_jid terechtkomt.
+ */
+async function resolveCanonicalJid(jid: string): Promise<string> {
+  if (!jid.endsWith("@lid") || !sock) return jid;
+  try {
+    const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
+    if (pn) return jidNormalizedUser(pn);
+  } catch (err) {
+    console.error(`Kon LID ${jid} niet herleiden naar telefoonnummer:`, err);
+  }
+  return jid;
+}
+
+/**
+ * Voegt alle reeds opgeslagen @lid-chats samen met hun canonieke telefoonnummer-JID,
+ * voor gesprekken die vóór deze fix al gesplitst waren opgeslagen.
+ */
+async function reconcileLidChats(): Promise<void> {
+  for (const lidJid of getAllLidChatJids()) {
+    const canonical = await resolveCanonicalJid(lidJid);
+    if (canonical !== lidJid) {
+      console.log(`Voeg gesplitste chat samen: ${lidJid} -> ${canonical}`);
+      mergeChatJid(lidJid, canonical);
+    }
+  }
 }
 
 function extractText(msg: proto.IWebMessageInfo): string | null {
@@ -59,12 +101,14 @@ function messageType(msg: proto.IWebMessageInfo): string {
 
 async function handleIncomingMessage(msg: proto.IWebMessageInfo) {
   if (!msg.key) return;
-  const chatJid = msg.key.remoteJid;
-  if (!chatJid || chatJid === "status@broadcast") return;
+  const rawChatJid = msg.key.remoteJid;
+  if (!rawChatJid || rawChatJid === "status@broadcast") return;
 
+  const chatJid = await resolveCanonicalJid(rawChatJid);
   const id = msg.key.id ?? "";
   const fromMe = msg.key.fromMe ?? false;
-  const sender = fromMe ? undefined : (msg.key.participant ?? chatJid);
+  const rawSender = fromMe ? undefined : (msg.key.participant ?? rawChatJid);
+  const sender = rawSender ? await resolveCanonicalJid(rawSender) : undefined;
   const timestamp = Number(msg.messageTimestamp ?? Date.now() / 1000) * 1000;
 
   const row: MessageRow = {
@@ -83,9 +127,13 @@ async function handleIncomingMessage(msg: proto.IWebMessageInfo) {
     upsertMediaMessage(chatJid, id, Buffer.from(proto.WebMessageInfo.encode(msg).finish()));
   }
 
+  // pushName is de weergavenaam van de AFZENDER, niet van het gesprek. In een 1-op-1 chat zijn die
+  // twee hetzelfde, dus daar viel het niet op. In een groep is chatJid de groep, en die kreeg zo de
+  // naam van wie er als laatste sprak — waarna getDisplayName die naam toonde in plaats van het
+  // onderwerp, en een groep dus niet op naam terug te vinden was.
   const name = msg.pushName ?? undefined;
-  if (name && !fromMe) {
-    upsertContact(chatJid, name, chatJid.endsWith("@s.whatsapp.net") ? chatJid.split("@")[0] : null);
+  if (name && !fromMe && sender) {
+    upsertContact(sender, name, sender.endsWith("@s.whatsapp.net") ? sender.split("@")[0] : null);
   }
 }
 
@@ -114,6 +162,10 @@ export async function connectWhatsApp(): Promise<void> {
     auth: state,
     logger,
     printQRInTerminal: false,
+    // Standaard leeft een QR maar 20-60s; te kort om een afbeelding naar de
+    // gebruiker te sturen en te laten scannen. Ruim verlengen bij het
+    // eenmalig koppelen van een nieuw apparaat.
+    qrTimeout: 120_000,
     browser: ["whatsapp-mcp-server", "Chrome", "1.0.0"],
     // Anders staat het account permanent "online" zolang de server draait,
     // en onderdrukt WhatsApp pushmeldingen naar de telefoon.
@@ -137,6 +189,7 @@ export async function connectWhatsApp(): Promise<void> {
       lastConnectedAt = Date.now();
       linkedNumber = sock?.user?.id?.split(":")[0];
       console.log(`WhatsApp verbonden als ${linkedNumber}`);
+      reconcileLidChats().catch((err) => console.error("Reconciliatie van @lid-chats mislukt:", err));
     } else if (connection === "close") {
       connectionState = "closed";
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
@@ -161,10 +214,15 @@ export async function connectWhatsApp(): Promise<void> {
   sock.ev.on("messaging-history.set", ({ chats, contacts, messages }) => {
     for (const chat of chats) {
       if (!chat.id) continue;
-      upsertChat(chat.id, chat.name ?? null, chat.id.endsWith("@g.us"), chat.conversationTimestamp ? Number(chat.conversationTimestamp) * 1000 : null);
+      resolveCanonicalJid(chat.id)
+        .then((jid) => upsertChat(jid, chat.name ?? null, jid.endsWith("@g.us"), chat.conversationTimestamp ? Number(chat.conversationTimestamp) * 1000 : null))
+        .catch((err) => console.error("Fout bij verwerken chat-geschiedenis:", err));
     }
     for (const contact of contacts) {
-      if (contact.id) upsertContact(contact.id, contact.name ?? contact.notify ?? null, contact.id.split("@")[0] ?? null);
+      if (!contact.id) continue;
+      resolveCanonicalJid(contact.id)
+        .then((jid) => upsertContact(jid, contact.name ?? contact.notify ?? null, jid.endsWith("@s.whatsapp.net") ? jid.split("@")[0] : null))
+        .catch((err) => console.error("Fout bij verwerken contact-geschiedenis:", err));
     }
     for (const msg of messages) {
       handleIncomingMessage(msg).catch((err) => console.error("Fout bij verwerken geschiedenis:", err));
@@ -173,7 +231,10 @@ export async function connectWhatsApp(): Promise<void> {
 
   sock.ev.on("contacts.upsert", (contacts) => {
     for (const contact of contacts) {
-      if (contact.id) upsertContact(contact.id, contact.name ?? contact.notify ?? null, contact.id.split("@")[0] ?? null);
+      if (!contact.id) continue;
+      resolveCanonicalJid(contact.id)
+        .then((jid) => upsertContact(jid, contact.name ?? contact.notify ?? null, jid.endsWith("@s.whatsapp.net") ? jid.split("@")[0] : null))
+        .catch((err) => console.error("Fout bij verwerken contact-update:", err));
     }
   });
 }
