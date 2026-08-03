@@ -190,7 +190,10 @@ export async function connectWhatsApp(): Promise<void> {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ["whatsapp-mcp-server", "Chrome", "1.0.0"],
+    // WhatsApp weigerde het koppelen (401) zolang hier een niet-bestaand
+    // platform stond ("whatsapp-mcp-server"). Houd dit een herkenbare
+    // desktop-identificatie.
+    browser: ["Mac OS", "Chrome", "121.0.0"],
     // Anders staat het account permanent "online" zolang de server draait,
     // en onderdrukt WhatsApp pushmeldingen naar de telefoon.
     markOnlineOnConnect: false,
