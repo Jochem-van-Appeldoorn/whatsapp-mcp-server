@@ -2,11 +2,30 @@ import { sync as spawnSync } from "cross-spawn";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, extname, basename } from "node:path";
-import { getSocket, getStoredMediaMessage, downloadMessageMedia } from "./whatsapp.js";
+import { waitUntilConnected, getStoredMediaMessage, downloadMessageMedia } from "./whatsapp.js";
 
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
 const VIDEO_EXT = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm"]);
 const AUDIO_EXT = new Set([".mp3", ".ogg", ".m4a", ".wav", ".aac", ".opus"]);
+
+const SEND_TIMEOUT_MS = 120_000;
+
+// Baileys geeft een media-upload geen eigen deadline: valt de socket weg tijdens
+// het versturen, dan blijft de call hangen. Liever een duidelijke fout.
+async function withSendTimeout<T>(what: string, work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Versturen van ${what} duurde langer dan ${SEND_TIMEOUT_MS / 1000}s en is afgebroken.`)),
+      SEND_TIMEOUT_MS
+    );
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 async function loadSource(source: string): Promise<{ buffer: Buffer; filename: string }> {
   if (/^https?:\/\//i.test(source)) {
@@ -42,25 +61,28 @@ async function convertToOggOpus(inputPath: string): Promise<Buffer> {
 export async function sendFile(jid: string, source: string, caption?: string): Promise<void> {
   const { buffer, filename } = await loadSource(source);
   const ext = extname(filename).toLowerCase();
-  const sock = getSocket();
+  const sock = await waitUntilConnected();
 
   if (IMAGE_EXT.has(ext)) {
-    await sock.sendMessage(jid, { image: buffer, caption });
+    await withSendTimeout(filename, sock.sendMessage(jid, { image: buffer, caption }));
   } else if (VIDEO_EXT.has(ext)) {
-    await sock.sendMessage(jid, { video: buffer, caption });
+    await withSendTimeout(filename, sock.sendMessage(jid, { video: buffer, caption }));
   } else {
-    await sock.sendMessage(jid, { document: buffer, fileName: filename, caption, mimetype: "application/octet-stream" });
+    await withSendTimeout(
+      filename,
+      sock.sendMessage(jid, { document: buffer, fileName: filename, caption, mimetype: "application/octet-stream" })
+    );
   }
 }
 
 export async function sendVoiceMessage(jid: string, source: string): Promise<{ sentAsVoiceNote: boolean; note?: string }> {
   const isLocal = !/^https?:\/\//i.test(source);
   const ext = extname(source).toLowerCase();
-  const sock = getSocket();
+  const sock = await waitUntilConnected();
 
   if (ext === ".ogg" || ext === ".opus") {
     const { buffer } = await loadSource(source);
-    await sock.sendMessage(jid, { audio: buffer, mimetype: "audio/ogg; codecs=opus", ptt: true });
+    await withSendTimeout(basename(source), sock.sendMessage(jid, { audio: buffer, mimetype: "audio/ogg; codecs=opus", ptt: true }));
     return { sentAsVoiceNote: true };
   }
 
@@ -79,7 +101,7 @@ export async function sendVoiceMessage(jid: string, source: string): Promise<{ s
     await writeFile(tmpFile, buffer);
     try {
       const converted = await convertToOggOpus(tmpFile);
-      await sock.sendMessage(jid, { audio: converted, mimetype: "audio/ogg; codecs=opus", ptt: true });
+      await withSendTimeout(filename, sock.sendMessage(jid, { audio: converted, mimetype: "audio/ogg; codecs=opus", ptt: true }));
       return { sentAsVoiceNote: true };
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -87,7 +109,7 @@ export async function sendVoiceMessage(jid: string, source: string): Promise<{ s
   }
 
   const converted = await convertToOggOpus(source);
-  await sock.sendMessage(jid, { audio: converted, mimetype: "audio/ogg; codecs=opus", ptt: true });
+  await withSendTimeout(basename(source), sock.sendMessage(jid, { audio: converted, mimetype: "audio/ogg; codecs=opus", ptt: true }));
   return { sentAsVoiceNote: true };
 }
 
