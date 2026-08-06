@@ -84,8 +84,8 @@ async function handleIncomingMessage(msg: proto.IWebMessageInfo) {
   }
 
   const name = msg.pushName ?? undefined;
-  if (name && !fromMe) {
-    upsertContact(chatJid, name, chatJid.endsWith("@s.whatsapp.net") ? chatJid.split("@")[0] : null);
+  if (name && !fromMe && sender) {
+    upsertContact(sender, name, sender.endsWith("@s.whatsapp.net") ? sender.split("@")[0] : null);
   }
 }
 
