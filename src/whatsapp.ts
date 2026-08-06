@@ -247,8 +247,11 @@ async function handleIncomingMessage(accountId: string, msg: proto.IWebMessageIn
   }
 
   const name = msg.pushName ?? undefined;
-  if (name && !fromMe) {
-    upsertContact(accountId, chatJid, name, chatJid.endsWith("@s.whatsapp.net") ? chatJid.split("@")[0] : null);
+  // In een groep is chatJid de groep en sender het lid dat postte. Op de
+  // groep schrijven maakte van elke groep een "contact" met de naam van wie
+  // er als laatste iets stuurde.
+  if (name && !fromMe && sender) {
+    upsertContact(accountId, sender, name, sender.endsWith("@s.whatsapp.net") ? sender.split("@")[0] : null);
   }
 }
 
