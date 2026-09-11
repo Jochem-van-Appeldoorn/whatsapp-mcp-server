@@ -8,6 +8,7 @@ import * as media from "./media.js";
 import { getStatuses, waitUntilConnected } from "./whatsapp.js";
 import { ACCOUNTS, ACCOUNT_IDS, DEFAULT_SEND_ACCOUNT, getAccount, isEnabled } from "./accounts.js";
 import { checkSendAllowed, createUnlock, mayAccountSend, type SendKind } from "./guard.js";
+import { checkSendRate, recordSend, waitOut, rateSummary } from "./throttle.js";
 
 const IMAGE_MIME_TYPES: Record<string, string> = {
   ".jpg": "image/jpeg",
@@ -235,6 +236,26 @@ function accountForChat(jid: string, requested?: string): string {
   return found[0] ?? DEFAULT_SEND_ACCOUNT;
 }
 
+/**
+ * Poortwachter plus rem, in die volgorde: eerst mag-dit-nummer-uberhaupt,
+ * dan gaat-het-niet-te-snel. Geeft de wachttijd terug die de aanroeper nog
+ * moet uitzitten voordat hij verstuurt.
+ */
+async function clearedToSend(opts: {
+  account: string;
+  jid: string;
+  kind: SendKind;
+  subject: string;
+  token?: string;
+}): Promise<{ ok: true } | { ok: false; response: ReturnType<typeof error> }> {
+  const guard = checkSendAllowed(opts);
+  if (!guard.ok) return { ok: false, response: error(guard.reason) };
+  const rate = checkSendRate(opts.account, opts.jid, opts.subject);
+  if (!rate.ok) return { ok: false, response: error(rate.reason) };
+  await waitOut(rate.waitMs);
+  return { ok: true };
+}
+
 export function registerTools(server: McpServer): void {
   server.registerTool(
     "get_current_time",
@@ -261,9 +282,13 @@ export function registerTools(server: McpServer): void {
         const mismatch = s.linkedNumber && s.expectedNumber && s.linkedNumber !== s.expectedNumber
           ? ` LET OP: verwacht ${s.expectedNumber}`
           : "";
-        const staat = s.enabled ? s.connectionState : "UIT (staat uitgeschakeld in accounts.json)";
+        const staat = !s.enabled
+          ? "UIT (staat uitgeschakeld in accounts.json)"
+          : s.haltedReason
+            ? `GESTOPT — ${s.haltedReason}`
+            : s.connectionState;
         return `${s.account} — ${s.label} (${nummer}) — ${staat} — ${
-          s.canSend ? "mag verzenden" : "VERZENDEN GEBLOKKEERD"
+          s.canSend ? `mag verzenden (${rateSummary(s.account)})` : "VERZENDEN GEBLOKKEERD"
         }${mismatch}`;
       });
       return text(`${nowLine()}\n${lines.join("\n")}`);
@@ -295,12 +320,13 @@ export function registerTools(server: McpServer): void {
       const acct = picked.account;
       const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
-      const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "text", subject: body, token: unlock_token });
-      if (!guard.ok) return error(guard.reason);
+      const cleared = await clearedToSend({ account: acct, jid: resolved.jid, kind: "text", subject: body, token: unlock_token });
+      if (!cleared.ok) return cleared.response;
       const sock = await waitUntilConnected(acct);
       await sock.sendMessage(resolved.jid, { text: body });
+      recordSend(acct, resolved.jid, body);
       return text(
-        `Verzonden vanaf ${acct} aan ${targetLabel(resolved.name, resolved.jid)} om ${fmtTime(Date.now())}.`
+        `Verzonden vanaf ${acct} aan ${targetLabel(resolved.name, resolved.jid)} om ${fmtTime(Date.now())}. (${rateSummary(acct)})`
       );
     }
   );
@@ -323,9 +349,10 @@ export function registerTools(server: McpServer): void {
       const acct = picked.account;
       const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
-      const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "file", subject: source, token: unlock_token });
-      if (!guard.ok) return error(guard.reason);
+      const cleared = await clearedToSend({ account: acct, jid: resolved.jid, kind: "file", subject: source, token: unlock_token });
+      if (!cleared.ok) return cleared.response;
       await media.sendFile(acct, resolved.jid, source, caption);
+      recordSend(acct, resolved.jid, source);
       return text(`Bestand verzonden vanaf ${acct} aan ${targetLabel(resolved.name, resolved.jid)}: ${source}`);
     }
   );
@@ -347,9 +374,10 @@ export function registerTools(server: McpServer): void {
       const acct = picked.account;
       const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
-      const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "audio", subject: source, token: unlock_token });
-      if (!guard.ok) return error(guard.reason);
+      const cleared = await clearedToSend({ account: acct, jid: resolved.jid, kind: "audio", subject: source, token: unlock_token });
+      if (!cleared.ok) return cleared.response;
       const result = await media.sendVoiceMessage(acct, resolved.jid, source);
+      recordSend(acct, resolved.jid, source);
       const kind = result.sentAsVoiceNote ? "Voice-bericht" : "Audiobestand";
       return text(
         `${kind} verzonden vanaf ${acct} aan ${targetLabel(resolved.name, resolved.jid)}.${result.note ? `\n${result.note}` : ""}`

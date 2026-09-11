@@ -8,6 +8,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import qrcode from "qrcode-terminal";
+import notifier from "node-notifier";
 import pino from "pino";
 import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -18,11 +19,19 @@ import { insertMessage, upsertContact, upsertChat, upsertMediaMessage, getMediaM
 const MEDIA_TYPES = new Set(["image", "video", "audio", "document", "sticker"]);
 
 const RECONNECT_BASE_MS = 1_000;
-const RECONNECT_MAX_MS = 60_000;
+const RECONNECT_MAX_MS = 5 * 60_000;
+// Blijf niet eindeloos aankloppen bij een sessie die niet meer welkom is.
+// WhatsApp leest aanhoudend herverbinden als botgedrag, en het houdt een
+// blokkade in stand: na de blokkade van 10-09-2026 bood deze server een
+// afgewezen sessie 825 keer op een dag opnieuw aan.
+const MAX_FAILURES_BEFORE_HALT = 15;
+const MAX_REFUSED_BEFORE_HALT = 3;
 const CONNECT_WAIT_MS = 45_000;
 // Na zoveel onbeantwoorde QR-rondes zakt het koppelen terug naar een laag tempo.
 const PAIRING_ROUNDS_FAST = 12;
 const PAIRING_SLOW_MS = 5 * 60_000;
+// Daarna helemaal stoppen: een QR die niemand scant hoeft niet uren te blijven vragen.
+const PAIRING_ROUNDS_MAX = 40;
 
 const HANDLED_EVENTS = [
   "creds.update",
@@ -50,6 +59,12 @@ interface AccountRuntime {
   reconnectTimer?: ReturnType<typeof setTimeout>;
   /** Aantal QR-rondes zonder scan, om niet eindeloos te blijven vragen. */
   pairingRounds: number;
+  /** Mislukte pogingen sinds de laatste geslaagde verbinding. */
+  consecutiveFailures: number;
+  /** Hoe vaak WhatsApp de sessie botweg weigerde (403). */
+  refusals: number;
+  /** Gezet als we bewust gestopt zijn; alleen een herstart hervat. */
+  haltedReason?: string;
 }
 
 const runtimes = new Map<string, AccountRuntime>();
@@ -61,6 +76,8 @@ for (const config of ACCOUNTS) {
     socketEpoch: 0,
     reconnectAttempts: 0,
     pairingRounds: 0,
+    consecutiveFailures: 0,
+    refusals: 0,
   });
 }
 
@@ -83,6 +100,7 @@ export interface AccountStatus {
   lastConnectedAt?: number;
   canSend: boolean;
   enabled: boolean;
+  haltedReason?: string;
 }
 
 export function getStatus(accountId: string): AccountStatus {
@@ -96,6 +114,7 @@ export function getStatus(accountId: string): AccountStatus {
     lastConnectedAt: rt.lastConnectedAt,
     canSend: rt.config.canSend,
     enabled: isEnabled(rt.config),
+    haltedReason: rt.haltedReason,
   };
 }
 
@@ -144,9 +163,25 @@ async function teardownSocket(target: WASocket | undefined) {
   }
 }
 
+function halt(accountId: string, reason: string) {
+  const rt = runtime(accountId);
+  rt.haltedReason = reason;
+  rt.connectionState = "closed";
+  if (rt.reconnectTimer) {
+    clearTimeout(rt.reconnectTimer);
+    rt.reconnectTimer = undefined;
+  }
+  log(accountId, `GESTOPT met herverbinden: ${reason}`);
+  notifier.notify({
+    title: `WhatsApp '${accountId}' is losgekoppeld`,
+    message: `${reason} Er wordt niet vanzelf opnieuw verbonden.`,
+    sound: true,
+  });
+}
+
 function scheduleReconnect(accountId: string, explicitDelayMs?: number) {
   const rt = runtime(accountId);
-  if (rt.reconnectTimer) return;
+  if (rt.reconnectTimer || rt.haltedReason) return;
   const delay = explicitDelayMs ?? Math.min(RECONNECT_BASE_MS * 2 ** rt.reconnectAttempts, RECONNECT_MAX_MS);
   if (explicitDelayMs === undefined) rt.reconnectAttempts += 1;
   log(accountId, `Herverbinden over ${Math.round(delay / 1000)}s (poging ${rt.reconnectAttempts}).`);
@@ -300,6 +335,9 @@ export async function connectAccount(accountId: string): Promise<void> {
       rt.lastConnectedAt = Date.now();
       rt.reconnectAttempts = 0;
       rt.pairingRounds = 0;
+      rt.consecutiveFailures = 0;
+      rt.refusals = 0;
+      rt.haltedReason = undefined;
       rt.linkedNumber = current.user?.id?.split(":")[0];
       log(accountId, `WhatsApp verbonden als ${rt.linkedNumber}`);
       if (config.number && rt.linkedNumber && rt.linkedNumber !== config.number) {
@@ -314,6 +352,27 @@ export async function connectAccount(accountId: string): Promise<void> {
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       log(accountId, `WhatsApp-verbinding gesloten (code ${statusCode}). Herverbinden: ${shouldReconnect}`);
+      rt.consecutiveFailures += 1;
+      if (statusCode === 403) {
+        // WhatsApp weigert deze sessie. Doorgaan met aanbieden helpt niet en
+        // maakt het erger.
+        rt.refusals += 1;
+        if (rt.refusals >= MAX_REFUSED_BEFORE_HALT) {
+          halt(
+            accountId,
+            `WhatsApp weigert de sessie (403), ${rt.refusals} keer op rij. Het apparaat is waarschijnlijk ontkoppeld of geblokkeerd. Koppel opnieuw met een QR-code.`
+          );
+          return;
+        }
+      }
+      if (!pairing && rt.consecutiveFailures >= MAX_FAILURES_BEFORE_HALT) {
+        halt(
+          accountId,
+          `${rt.consecutiveFailures} mislukte pogingen op rij zonder verbinding. Verder proberen belast WhatsApp onnodig.`
+        );
+        return;
+      }
+
       if (statusCode === DisconnectReason.restartRequired) {
         // Dit komt direct na een geslaagde QR-scan. WhatsApp verwacht nu
         // meteen een nieuwe verbinding; wachten maakt de koppeling ongeldig
@@ -326,6 +385,13 @@ export async function connectAccount(accountId: string): Promise<void> {
         // nummer dat niemand scant (of dat geblokkeerd is) moet niet uren
         // lang elke drie seconden het log vullen.
         rt.pairingRounds += 1;
+        if (rt.pairingRounds >= PAIRING_ROUNDS_MAX) {
+          halt(
+            accountId,
+            `Na ${rt.pairingRounds} QR-codes is er niet gescand. Herstart de server als je klaar staat om te koppelen.`
+          );
+          return;
+        }
         if (rt.pairingRounds <= PAIRING_ROUNDS_FAST) {
           scheduleReconnect(accountId, 3_000);
         } else {
