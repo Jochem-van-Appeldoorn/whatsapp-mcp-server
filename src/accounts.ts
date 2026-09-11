@@ -13,6 +13,8 @@ export interface AccountConfig {
   canSend: boolean;
   /** Meldingen over onbeantwoorde berichten voor dit account. */
   reminders: boolean;
+  /** false = niet verbinden. Voor een nummer dat tijdelijk niet werkt. */
+  enabled?: boolean;
 }
 
 // Standaard: het Claude-nummer mag verzenden, Davids eigen nummer niet.
@@ -47,8 +49,16 @@ function loadAccounts(): AccountConfig[] {
 export const ACCOUNTS: AccountConfig[] = loadAccounts();
 export const ACCOUNT_IDS: string[] = ACCOUNTS.map((a) => a.id);
 
-/** Account waar een verzendactie naartoe gaat als er geen is opgegeven. */
-export const DEFAULT_SEND_ACCOUNT: string = (ACCOUNTS.find((a) => a.canSend) ?? ACCOUNTS[0]).id;
+export function isEnabled(account: AccountConfig): boolean {
+  return account.enabled !== false;
+}
+
+/**
+ * Account waar een verzendactie naartoe gaat als er geen is opgegeven.
+ * Undefined als er geen enkel werkend nummer is dat mag verzenden; de
+ * verzendtools zeggen dat dan met zoveel woorden.
+ */
+export const DEFAULT_SEND_ACCOUNT: string | undefined = ACCOUNTS.find((a) => a.canSend && isEnabled(a))?.id;
 
 export function getAccount(id: string): AccountConfig {
   const found = ACCOUNTS.find((a) => a.id === id);

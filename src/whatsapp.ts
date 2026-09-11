@@ -12,7 +12,7 @@ import pino from "pino";
 import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { authDir, qrPath, downloadsDir } from "./paths.js";
-import { ACCOUNTS, getAccount, type AccountConfig } from "./accounts.js";
+import { ACCOUNTS, getAccount, isEnabled, type AccountConfig } from "./accounts.js";
 import { insertMessage, upsertContact, upsertChat, upsertMediaMessage, getMediaMessageRaw, type MessageRow } from "./db.js";
 
 const MEDIA_TYPES = new Set(["image", "video", "audio", "document", "sticker"]);
@@ -20,6 +20,9 @@ const MEDIA_TYPES = new Set(["image", "video", "audio", "document", "sticker"]);
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 60_000;
 const CONNECT_WAIT_MS = 45_000;
+// Na zoveel onbeantwoorde QR-rondes zakt het koppelen terug naar een laag tempo.
+const PAIRING_ROUNDS_FAST = 12;
+const PAIRING_SLOW_MS = 5 * 60_000;
 
 const HANDLED_EVENTS = [
   "creds.update",
@@ -45,12 +48,20 @@ interface AccountRuntime {
   socketEpoch: number;
   reconnectAttempts: number;
   reconnectTimer?: ReturnType<typeof setTimeout>;
+  /** Aantal QR-rondes zonder scan, om niet eindeloos te blijven vragen. */
+  pairingRounds: number;
 }
 
 const runtimes = new Map<string, AccountRuntime>();
 
 for (const config of ACCOUNTS) {
-  runtimes.set(config.id, { config, connectionState: "connecting", socketEpoch: 0, reconnectAttempts: 0 });
+  runtimes.set(config.id, {
+    config,
+    connectionState: isEnabled(config) ? "connecting" : "closed",
+    socketEpoch: 0,
+    reconnectAttempts: 0,
+    pairingRounds: 0,
+  });
 }
 
 function runtime(accountId: string): AccountRuntime {
@@ -71,6 +82,7 @@ export interface AccountStatus {
   expectedNumber?: string;
   lastConnectedAt?: number;
   canSend: boolean;
+  enabled: boolean;
 }
 
 export function getStatus(accountId: string): AccountStatus {
@@ -83,6 +95,7 @@ export function getStatus(accountId: string): AccountStatus {
     expectedNumber: rt.config.number,
     lastConnectedAt: rt.lastConnectedAt,
     canSend: rt.config.canSend,
+    enabled: isEnabled(rt.config),
   };
 }
 
@@ -286,6 +299,7 @@ export async function connectAccount(accountId: string): Promise<void> {
       rt.connectionState = "open";
       rt.lastConnectedAt = Date.now();
       rt.reconnectAttempts = 0;
+      rt.pairingRounds = 0;
       rt.linkedNumber = current.user?.id?.split(":")[0];
       log(accountId, `WhatsApp verbonden als ${rt.linkedNumber}`);
       if (config.number && rt.linkedNumber && rt.linkedNumber !== config.number) {
@@ -308,8 +322,18 @@ export async function connectAccount(accountId: string): Promise<void> {
         rt.reconnectAttempts = 0;
         scheduleReconnect(accountId, 0);
       } else if (shouldReconnect && pairing) {
-        // Verlopen QR-code: gewoon een nieuwe tonen, niet afbouwen.
-        scheduleReconnect(accountId, 3_000);
+        // Verlopen QR-code: snel een nieuwe tonen. Maar niet eindeloos — een
+        // nummer dat niemand scant (of dat geblokkeerd is) moet niet uren
+        // lang elke drie seconden het log vullen.
+        rt.pairingRounds += 1;
+        if (rt.pairingRounds <= PAIRING_ROUNDS_FAST) {
+          scheduleReconnect(accountId, 3_000);
+        } else {
+          if (rt.pairingRounds === PAIRING_ROUNDS_FAST + 1) {
+            log(accountId, `Geen QR gescand na ${PAIRING_ROUNDS_FAST} pogingen. Verder op een laag pitje (elke 5 minuten).`);
+          }
+          scheduleReconnect(accountId, PAIRING_SLOW_MS);
+        }
       } else if (shouldReconnect) {
         scheduleReconnect(accountId);
       } else {
@@ -359,8 +383,12 @@ export async function connectAccount(accountId: string): Promise<void> {
  * tegenhouden: de server draait door en probeert dat account opnieuw.
  */
 export async function connectAll(): Promise<void> {
+  const actief = ACCOUNTS.filter(isEnabled);
+  for (const account of ACCOUNTS) {
+    if (!isEnabled(account)) log(account.id, `Account staat uit in de configuratie; niet verbinden.`);
+  }
   await Promise.all(
-    ACCOUNTS.map((account) =>
+    actief.map((account) =>
       connectAccount(account.id).catch((err) => {
         log(account.id, `Verbinden mislukt: ${err instanceof Error ? err.message : String(err)}`);
         scheduleReconnect(account.id);

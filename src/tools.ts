@@ -6,7 +6,7 @@ import { resolveChatTarget, chatAccounts, type ResolveResult } from "./contacts.
 import * as db from "./db.js";
 import * as media from "./media.js";
 import { getStatuses, waitUntilConnected } from "./whatsapp.js";
-import { ACCOUNTS, ACCOUNT_IDS, DEFAULT_SEND_ACCOUNT, getAccount } from "./accounts.js";
+import { ACCOUNTS, ACCOUNT_IDS, DEFAULT_SEND_ACCOUNT, getAccount, isEnabled } from "./accounts.js";
 import { checkSendAllowed, createUnlock, mayAccountSend, type SendKind } from "./guard.js";
 
 const IMAGE_MIME_TYPES: Record<string, string> = {
@@ -31,7 +31,37 @@ const readAccountParam = accountEnum
   .describe(`Beperk tot één nummer (${ACCOUNT_IDS.join(", ")}); standaard alle gekoppelde nummers`);
 const sendAccountParam = accountEnum
   .optional()
-  .describe(`Verzend vanaf dit nummer; standaard '${DEFAULT_SEND_ACCOUNT}'`);
+  .describe(
+    DEFAULT_SEND_ACCOUNT
+      ? `Verzend vanaf dit nummer; standaard '${DEFAULT_SEND_ACCOUNT}'`
+      : "Verzend vanaf dit nummer (er is op dit moment geen nummer dat mag verzenden)"
+  );
+
+/**
+ * Bepaalt vanaf welk nummer er verstuurd wordt, en weigert meteen als dat
+ * nummer er niet is of uitstaat. Zo krijgt de aanroeper een leesbare reden in
+ * plaats van een time-out op een socket die nooit opengaat.
+ */
+function resolveSendAccount(requested?: string): { ok: true; account: string } | { ok: false; response: ReturnType<typeof error> } {
+  const acct = requested ?? DEFAULT_SEND_ACCOUNT;
+  if (!acct) {
+    return {
+      ok: false,
+      response: error(
+        "Er is op dit moment geen WhatsApp-nummer dat mag verzenden. Controleer list_accounts; " +
+          "waarschijnlijk staat het verzendnummer uit of is het niet gekoppeld. Leg het bericht aan David voor."
+      ),
+    };
+  }
+  const cfg = getAccount(acct);
+  if (!isEnabled(cfg)) {
+    return {
+      ok: false,
+      response: error(`Account '${acct}' (${cfg.label}) staat uit in de configuratie en kan niets versturen.`),
+    };
+  }
+  return { ok: true, account: acct };
+}
 
 // sv-SE levert ISO-achtige datums ("2026-07-02") en 24-uurs tijden, altijd in
 // TZ — onafhankelijk van de systeem-tijdzone waar de server draait.
@@ -231,7 +261,8 @@ export function registerTools(server: McpServer): void {
         const mismatch = s.linkedNumber && s.expectedNumber && s.linkedNumber !== s.expectedNumber
           ? ` LET OP: verwacht ${s.expectedNumber}`
           : "";
-        return `${s.account} — ${s.label} (${nummer}) — ${s.connectionState} — ${
+        const staat = s.enabled ? s.connectionState : "UIT (staat uitgeschakeld in accounts.json)";
+        return `${s.account} — ${s.label} (${nummer}) — ${staat} — ${
           s.canSend ? "mag verzenden" : "VERZENDEN GEBLOKKEERD"
         }${mismatch}`;
       });
@@ -247,7 +278,7 @@ export function registerTools(server: McpServer): void {
         `(search_contacts vooraf is onnodig). Tijdstip in de tekst? Bepaal dat via get_current_time of een Nu:-regel, ` +
         `niet uit je hoofd.` +
         (LOCKED_ACCOUNTS.length
-          ? ` Standaard gaat het bericht vanaf '${DEFAULT_SEND_ACCOUNT}'. Vanaf ${LOCKED_ACCOUNTS.map((a) => `'${a}'`).join(
+          ? ` Standaard gaat het bericht vanaf '${DEFAULT_SEND_ACCOUNT ?? "(geen verzendnummer beschikbaar)"}'. Vanaf ${LOCKED_ACCOUNTS.map((a) => `'${a}'`).join(
               ", "
             )} is verzenden geblokkeerd: dat is Davids eigen nummer en daar gaat niets uit zonder dat hij het in het gesprek heeft toegestaan (zie unlock_prive_send).`
           : ""),
@@ -259,7 +290,9 @@ export function registerTools(server: McpServer): void {
       },
     },
     async ({ to, text: body, account, unlock_token }) => {
-      const acct = account ?? DEFAULT_SEND_ACCOUNT;
+      const picked = resolveSendAccount(account);
+      if (!picked.ok) return picked.response;
+      const acct = picked.account;
       const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
       const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "text", subject: body, token: unlock_token });
@@ -285,7 +318,9 @@ export function registerTools(server: McpServer): void {
       },
     },
     async ({ to, source, caption, account, unlock_token }) => {
-      const acct = account ?? DEFAULT_SEND_ACCOUNT;
+      const picked = resolveSendAccount(account);
+      if (!picked.ok) return picked.response;
+      const acct = picked.account;
       const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
       const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "file", subject: source, token: unlock_token });
@@ -307,7 +342,9 @@ export function registerTools(server: McpServer): void {
       },
     },
     async ({ to, source, account, unlock_token }) => {
-      const acct = account ?? DEFAULT_SEND_ACCOUNT;
+      const picked = resolveSendAccount(account);
+      if (!picked.ok) return picked.response;
+      const acct = picked.account;
       const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
       const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "audio", subject: source, token: unlock_token });
