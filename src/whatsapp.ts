@@ -131,11 +131,11 @@ async function teardownSocket(target: WASocket | undefined) {
   }
 }
 
-function scheduleReconnect(accountId: string) {
+function scheduleReconnect(accountId: string, explicitDelayMs?: number) {
   const rt = runtime(accountId);
   if (rt.reconnectTimer) return;
-  const delay = Math.min(RECONNECT_BASE_MS * 2 ** rt.reconnectAttempts, RECONNECT_MAX_MS);
-  rt.reconnectAttempts += 1;
+  const delay = explicitDelayMs ?? Math.min(RECONNECT_BASE_MS * 2 ** rt.reconnectAttempts, RECONNECT_MAX_MS);
+  if (explicitDelayMs === undefined) rt.reconnectAttempts += 1;
   log(accountId, `Herverbinden over ${Math.round(delay / 1000)}s (poging ${rt.reconnectAttempts}).`);
   rt.reconnectTimer = setTimeout(() => {
     rt.reconnectTimer = undefined;
@@ -241,6 +241,12 @@ export async function connectAccount(accountId: string): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(authDir(accountId));
   const { version } = await fetchLatestBaileysVersion();
 
+  // Zolang er nog geen geregistreerde sessie is, is dit een koppelronde: de
+  // QR verloopt na ~20s (code 408) en er moet snel een nieuwe komen. Die
+  // time-outs mogen de wachttijd niet laten oplopen, want direct na een
+  // geslaagde scan moet de socket meteen opnieuw verbinden.
+  const pairing = !state.creds.registered;
+
   const current = makeWASocket({
     version,
     auth: state,
@@ -294,7 +300,17 @@ export async function connectAccount(accountId: string): Promise<void> {
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       log(accountId, `WhatsApp-verbinding gesloten (code ${statusCode}). Herverbinden: ${shouldReconnect}`);
-      if (shouldReconnect) {
+      if (statusCode === DisconnectReason.restartRequired) {
+        // Dit komt direct na een geslaagde QR-scan. WhatsApp verwacht nu
+        // meteen een nieuwe verbinding; wachten maakt de koppeling ongeldig
+        // en levert een 401 op.
+        log(accountId, "Koppeling gelukt. Meteen opnieuw verbinden zoals WhatsApp vraagt.");
+        rt.reconnectAttempts = 0;
+        scheduleReconnect(accountId, 0);
+      } else if (shouldReconnect && pairing) {
+        // Verlopen QR-code: gewoon een nieuwe tonen, niet afbouwen.
+        scheduleReconnect(accountId, 3_000);
+      } else if (shouldReconnect) {
         scheduleReconnect(accountId);
       } else {
         log(accountId, `Sessie uitgelogd. Verwijder ${authDir(accountId)} en scan opnieuw een QR-code.`);
