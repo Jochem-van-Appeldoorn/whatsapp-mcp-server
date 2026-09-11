@@ -2,10 +2,12 @@ import { z } from "zod";
 import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { resolveChatTarget, type ResolveResult } from "./contacts.js";
+import { resolveChatTarget, chatAccounts, type ResolveResult } from "./contacts.js";
 import * as db from "./db.js";
 import * as media from "./media.js";
-import { getSocket, getStatus } from "./whatsapp.js";
+import { getStatuses, waitUntilConnected } from "./whatsapp.js";
+import { ACCOUNTS, ACCOUNT_IDS, DEFAULT_SEND_ACCOUNT, getAccount } from "./accounts.js";
+import { checkSendAllowed, createUnlock, mayAccountSend, type SendKind } from "./guard.js";
 
 const IMAGE_MIME_TYPES: Record<string, string> = {
   ".jpg": "image/jpeg",
@@ -18,6 +20,18 @@ const IMAGE_MIME_TYPES: Record<string, string> = {
 const TZ = "Europe/Amsterdam";
 const MAX_BODY_CHARS = 400;
 const MAX_AMBIGUOUS_CANDIDATES = 8;
+
+const MULTI_ACCOUNT = ACCOUNTS.length > 1;
+const SENDING_ACCOUNTS = ACCOUNTS.filter((a) => a.canSend).map((a) => a.id);
+const LOCKED_ACCOUNTS = ACCOUNTS.filter((a) => !a.canSend).map((a) => a.id);
+
+const accountEnum = z.enum(ACCOUNT_IDS as [string, ...string[]]);
+const readAccountParam = accountEnum
+  .optional()
+  .describe(`Beperk tot één nummer (${ACCOUNT_IDS.join(", ")}); standaard alle gekoppelde nummers`);
+const sendAccountParam = accountEnum
+  .optional()
+  .describe(`Verzend vanaf dit nummer; standaard '${DEFAULT_SEND_ACCOUNT}'`);
 
 // sv-SE levert ISO-achtige datums ("2026-07-02") en 24-uurs tijden, altijd in
 // TZ — onafhankelijk van de systeem-tijdzone waar de server draait.
@@ -58,6 +72,12 @@ function text(body: string) {
 
 function error(message: string) {
   return { content: [{ type: "text" as const, text: message }], isError: true as const };
+}
+
+// Welk nummer een regel gezien heeft. Alleen tonen als er meer dan één
+// gekoppeld is, anders is het ruis.
+function accountTag(account: string | undefined): string {
+  return MULTI_ACCOUNT && account ? ` [${account}]` : "";
 }
 
 // Toon telefoonnummer-JIDs als kaal nummer; @g.us/@lid (en shortcodes)
@@ -118,13 +138,14 @@ function truncateBody(body: string, query?: string): string {
 }
 
 function senderName(msg: db.MessageRow): string {
-  return msg.from_me ? "Jij" : db.getDisplayName(msg.sender || msg.chat_jid);
+  return msg.from_me ? "Jij" : db.getDisplayName(msg.sender || msg.chat_jid, msg.account);
 }
 
 interface MsgLineOpts {
   withChat?: boolean;
   withId?: boolean;
   withDate?: boolean;
+  withAccount?: boolean;
   fullText?: boolean;
   query?: string;
 }
@@ -135,7 +156,8 @@ interface MsgLineOpts {
 // download_media — IDs zijn lang en meestal irrelevant.
 function msgLine(msg: db.MessageRow, opts: MsgLineOpts = {}): string {
   const stamp = opts.withDate ? fmtTime(msg.timestamp) : fmtClock(msg.timestamp);
-  const chatPart = opts.withChat ? ` {${db.getDisplayName(msg.chat_jid)}}` : "";
+  const chatPart = opts.withChat ? ` {${db.getDisplayName(msg.chat_jid, msg.account)}}` : "";
+  const acctPart = opts.withAccount ? accountTag(msg.account) : "";
   let meta = "";
   if (msg.type !== "text") {
     meta = ` <${msg.type} id=${msg.id}${msg.media_path ? ` pad=${msg.media_path}` : ""}>`;
@@ -143,7 +165,7 @@ function msgLine(msg: db.MessageRow, opts: MsgLineOpts = {}): string {
     meta = ` <id=${msg.id}>`;
   }
   const body = msg.text ? (opts.fullText ? msg.text : truncateBody(msg.text, opts.query)) : "";
-  return `[${stamp}]${chatPart} ${senderName(msg)}: ${body}${meta}`;
+  return `[${stamp}]${acctPart}${chatPart} ${senderName(msg)}: ${body}${meta}`;
 }
 
 // Chronologische lijst met een dagkop bij elke datumwissel; anchorId markeert
@@ -164,14 +186,23 @@ function renderMessages(messages: db.MessageRow[], opts: MsgLineOpts & { anchorI
 }
 
 function chatLine(chat: db.ChatRow): string {
-  const name = db.getDisplayName(chat.jid);
+  const name = db.getDisplayName(chat.jid, chat.account);
   const id = displayJid(chat.jid);
-  return `${name}${chat.is_group ? " (groep)" : ""}${id !== name ? ` — ${id}` : ""}`;
+  const accounts = MULTI_ACCOUNT ? chatAccounts(chat.jid) : [];
+  const tag = accounts.length ? ` [${accounts.join(", ")}]` : "";
+  return `${name}${chat.is_group ? " (groep)" : ""}${id !== name ? ` — ${id}` : ""}${tag}`;
 }
 
 function lastMessageSummary(msg: db.MessageRow): string {
   const body = msg.text ? snippet(msg.text, 60) : `<${msg.type}>`;
   return `[${fmtTime(msg.timestamp)}] ${senderName(msg)}: ${body}`;
+}
+
+/** Kiest het account waaronder een chat gelezen of opgevraagd wordt. */
+function accountForChat(jid: string, requested?: string): string {
+  if (requested) return requested;
+  const found = chatAccounts(jid);
+  return found[0] ?? DEFAULT_SEND_ACCOUNT;
 }
 
 export function registerTools(server: McpServer): void {
@@ -189,20 +220,55 @@ export function registerTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "list_accounts",
+    {
+      description: "Toon de gekoppelde WhatsApp-nummers, met per nummer of er vanaf verzonden mag worden.",
+      inputSchema: {},
+    },
+    async () => {
+      const lines = getStatuses().map((s) => {
+        const nummer = s.linkedNumber ?? s.expectedNumber ?? "onbekend";
+        const mismatch = s.linkedNumber && s.expectedNumber && s.linkedNumber !== s.expectedNumber
+          ? ` LET OP: verwacht ${s.expectedNumber}`
+          : "";
+        return `${s.account} — ${s.label} (${nummer}) — ${s.connectionState} — ${
+          s.canSend ? "mag verzenden" : "VERZENDEN GEBLOKKEERD"
+        }${mismatch}`;
+      });
+      return text(`${nowLine()}\n${lines.join("\n")}`);
+    }
+  );
+
+  server.registerTool(
     "send_message",
     {
       description:
-        "Stuur een WhatsApp-tekstbericht. 'to' mag naam, nummer of JID zijn; namen worden automatisch opgezocht (search_contacts vooraf is onnodig). Tijdstip in de tekst? Bepaal dat via get_current_time of een Nu:-regel, niet uit je hoofd.",
+        `Stuur een WhatsApp-tekstbericht. 'to' mag naam, nummer of JID zijn; namen worden automatisch opgezocht ` +
+        `(search_contacts vooraf is onnodig). Tijdstip in de tekst? Bepaal dat via get_current_time of een Nu:-regel, ` +
+        `niet uit je hoofd.` +
+        (LOCKED_ACCOUNTS.length
+          ? ` Standaard gaat het bericht vanaf '${DEFAULT_SEND_ACCOUNT}'. Vanaf ${LOCKED_ACCOUNTS.map((a) => `'${a}'`).join(
+              ", "
+            )} is verzenden geblokkeerd: dat is Davids eigen nummer en daar gaat niets uit zonder dat hij het in het gesprek heeft toegestaan (zie unlock_prive_send).`
+          : ""),
       inputSchema: {
         to: z.string(),
         text: z.string(),
+        account: sendAccountParam,
+        unlock_token: z.string().optional().describe("Alleen nodig voor een geblokkeerd account; komt uit unlock_prive_send"),
       },
     },
-    async ({ to, text: body }) => {
-      const resolved = requireResolved(resolveChatTarget(to));
+    async ({ to, text: body, account, unlock_token }) => {
+      const acct = account ?? DEFAULT_SEND_ACCOUNT;
+      const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
-      await getSocket().sendMessage(resolved.jid, { text: body });
-      return text(`Verzonden aan ${targetLabel(resolved.name, resolved.jid)} om ${fmtTime(Date.now())}.`);
+      const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "text", subject: body, token: unlock_token });
+      if (!guard.ok) return error(guard.reason);
+      const sock = await waitUntilConnected(acct);
+      await sock.sendMessage(resolved.jid, { text: body });
+      return text(
+        `Verzonden vanaf ${acct} aan ${targetLabel(resolved.name, resolved.jid)} om ${fmtTime(Date.now())}.`
+      );
     }
   );
 
@@ -214,13 +280,18 @@ export function registerTools(server: McpServer): void {
         to: z.string().describe("Naam, nummer of JID"),
         source: z.string().describe("Lokaal pad of URL"),
         caption: z.string().optional(),
+        account: sendAccountParam,
+        unlock_token: z.string().optional().describe("Alleen nodig voor een geblokkeerd account"),
       },
     },
-    async ({ to, source, caption }) => {
-      const resolved = requireResolved(resolveChatTarget(to));
+    async ({ to, source, caption, account, unlock_token }) => {
+      const acct = account ?? DEFAULT_SEND_ACCOUNT;
+      const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
-      await media.sendFile(resolved.jid, source, caption);
-      return text(`Bestand verzonden aan ${targetLabel(resolved.name, resolved.jid)}: ${source}`);
+      const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "file", subject: source, token: unlock_token });
+      if (!guard.ok) return error(guard.reason);
+      await media.sendFile(acct, resolved.jid, source, caption);
+      return text(`Bestand verzonden vanaf ${acct} aan ${targetLabel(resolved.name, resolved.jid)}: ${source}`);
     }
   );
 
@@ -231,14 +302,75 @@ export function registerTools(server: McpServer): void {
       inputSchema: {
         to: z.string().describe("Naam, nummer of JID"),
         source: z.string().describe("Lokaal pad of URL"),
+        account: sendAccountParam,
+        unlock_token: z.string().optional().describe("Alleen nodig voor een geblokkeerd account"),
       },
     },
-    async ({ to, source }) => {
-      const resolved = requireResolved(resolveChatTarget(to));
+    async ({ to, source, account, unlock_token }) => {
+      const acct = account ?? DEFAULT_SEND_ACCOUNT;
+      const resolved = requireResolved(resolveChatTarget(to, { account: acct }));
       if (!resolved.ok) return resolved.response;
-      const result = await media.sendVoiceMessage(resolved.jid, source);
+      const guard = checkSendAllowed({ account: acct, jid: resolved.jid, kind: "audio", subject: source, token: unlock_token });
+      if (!guard.ok) return error(guard.reason);
+      const result = await media.sendVoiceMessage(acct, resolved.jid, source);
       const kind = result.sentAsVoiceNote ? "Voice-bericht" : "Audiobestand";
-      return text(`${kind} verzonden aan ${targetLabel(resolved.name, resolved.jid)}.${result.note ? `\n${result.note}` : ""}`);
+      return text(
+        `${kind} verzonden vanaf ${acct} aan ${targetLabel(resolved.name, resolved.jid)}.${result.note ? `\n${result.note}` : ""}`
+      );
+    }
+  );
+
+  server.registerTool(
+    "unlock_prive_send",
+    {
+      description:
+        `Ontgrendel één verzendactie vanaf een geblokkeerd nummer (${
+          LOCKED_ACCOUNTS.length ? LOCKED_ACCOUNTS.map((a) => `'${a}'`).join(", ") : "geen"
+        }). ` +
+        `ALLEEN aanroepen nadat David in dit gesprek expliciet heeft gezegd dat er vanaf zijn eigen nummer verstuurd mag ` +
+        `worden. Niet aanroepen op eigen initiatief, niet 'vast klaarzetten', en niet als David alleen om een concept vroeg. ` +
+        `De ontgrendeling geldt voor precies deze ontvanger en deze inhoud, vervalt na 3 minuten of na één gebruik, geeft ` +
+        `David een melding op zijn scherm en komt in het serverlog te staan.`,
+      inputSchema: {
+        account: accountEnum.describe("Het geblokkeerde account, bijvoorbeeld 'prive'"),
+        to: z.string().describe("Naam, nummer of JID van de ontvanger"),
+        content: z.string().describe("Exact de tekst die verstuurd wordt, of bij een bestand het pad/de URL"),
+        kind: z.enum(["text", "file", "audio"]).optional().describe("standaard 'text'"),
+        confirmation: z
+          .string()
+          .describe("Davids eigen woorden waarmee hij dit toestond, letterlijk geciteerd uit dit gesprek"),
+      },
+    },
+    async ({ account, to, content, kind, confirmation }) => {
+      let cfg;
+      try {
+        cfg = getAccount(account);
+      } catch (err) {
+        return error(err instanceof Error ? err.message : String(err));
+      }
+      if (mayAccountSend(account)) {
+        return error(`Account '${account}' mag al verzenden; gebruik send_message zonder ontgrendeling.`);
+      }
+      if (!confirmation.trim()) {
+        return error("Geef Davids eigen woorden mee als bevestiging. Zonder toestemming in het gesprek geen ontgrendeling.");
+      }
+      const resolved = requireResolved(resolveChatTarget(to, { account }));
+      if (!resolved.ok) return resolved.response;
+
+      const label = targetLabel(resolved.name, resolved.jid);
+      const unlock = createUnlock({
+        account,
+        jid: resolved.jid,
+        kind: (kind ?? "text") as SendKind,
+        subject: content,
+        confirmation,
+        targetLabel: label,
+      });
+      return text(
+        `Ontgrendeld: één ${unlock.kind}-bericht vanaf ${account} (${cfg.label}) aan ${label}, geldig tot ` +
+          `${fmtClock(unlock.createdAt + 3 * 60_000)}.\nGeef dit mee als unlock_token: ${unlock.token}\n` +
+          `David heeft een melding op zijn scherm gekregen.`
+      );
     }
   );
 
@@ -250,13 +382,14 @@ export function registerTools(server: McpServer): void {
       inputSchema: {
         chat: z.string().describe("Naam, nummer of JID"),
         message_id: z.string(),
+        account: readAccountParam,
       },
     },
-    async ({ chat, message_id }) => {
-      const resolved = requireResolved(resolveChatTarget(chat));
+    async ({ chat, message_id, account }) => {
+      const resolved = requireResolved(resolveChatTarget(chat, { account }));
       if (!resolved.ok) return resolved.response;
       try {
-        const path = await media.downloadIncomingMedia(resolved.jid, message_id);
+        const path = await media.downloadIncomingMedia(resolved.jid, message_id, account);
         const mimeType = IMAGE_MIME_TYPES[extname(path).toLowerCase()];
         if (mimeType) {
           const data = (await readFile(path)).toString("base64");
@@ -278,17 +411,17 @@ export function registerTools(server: McpServer): void {
     "search_contacts",
     {
       description: "Zoek contacten op naam of telefoonnummer.",
-      inputSchema: { query: z.string() },
+      inputSchema: { query: z.string(), account: readAccountParam },
     },
-    async ({ query }) => {
-      const rows = db.searchContacts(query);
+    async ({ query, account }) => {
+      const rows = db.searchContacts(query, account);
       if (!rows.length) return text("Geen contacten gevonden.");
       return text(
         rows
           .map((c) => {
             const id = displayJid(c.jid);
             const extra = c.number && id !== c.number && !c.jid.startsWith(`${c.number}@`) ? ` (nummer: ${c.number})` : "";
-            return `${c.name ?? "(onbekend)"} — ${id}${extra}`;
+            return `${c.name ?? "(onbekend)"} — ${id}${extra}${accountTag(c.account)}`;
           })
           .join("\n")
       );
@@ -302,13 +435,14 @@ export function registerTools(server: McpServer): void {
       inputSchema: {
         limit: z.number().int().positive().max(200).optional().describe("standaard 20"),
         include_groups: z.boolean().optional().describe("standaard true"),
+        account: readAccountParam,
       },
     },
-    async ({ limit, include_groups }) => {
-      const chats = db.getChats({ limit, includeGroups: include_groups });
+    async ({ limit, include_groups, account }) => {
+      const chats = db.getChats({ limit, includeGroups: include_groups, account });
       if (!chats.length) return text(`${nowLine()}\nGeen chats gevonden.`);
       const lines = chats.map((chat) => {
-        const last = db.getLastInteraction(chat.jid);
+        const last = db.getLastInteraction(chat.jid, account);
         return `${chatLine(chat)}${last ? `\n  ${lastMessageSummary(last)}` : ""}`;
       });
       return text(`${nowLine()}\n${lines.join("\n")}`);
@@ -330,12 +464,13 @@ export function registerTools(server: McpServer): void {
         limit: z.number().int().positive().max(500).optional().describe("standaard 20"),
         include_ids: z.boolean().optional().describe("Toon bericht-IDs (voor get_message_context/download_media)"),
         full_text: z.boolean().optional().describe(`Geen afkapping op ${MAX_BODY_CHARS} tekens`),
+        account: readAccountParam,
       },
     },
-    async ({ chat, query, sender, date_from, date_to, is_from_me, limit, include_ids, full_text }) => {
+    async ({ chat, query, sender, date_from, date_to, is_from_me, limit, include_ids, full_text, account }) => {
       let chatJid: string | undefined;
       if (chat) {
-        const resolved = requireResolved(resolveChatTarget(chat));
+        const resolved = requireResolved(resolveChatTarget(chat, { account }));
         if (!resolved.ok) return resolved.response;
         chatJid = resolved.jid;
       }
@@ -348,15 +483,17 @@ export function registerTools(server: McpServer): void {
           dateTo: toEpochMs(date_to),
           isFromMe: is_from_me,
           limit,
+          account,
         })
         .reverse(); // chronologisch, oudste eerst
       if (!messages.length) return text(`${nowLine()}\nGeen berichten gevonden.`);
       const header = chatJid
-        ? `Chat: ${targetLabel(db.getDisplayName(chatJid), chatJid)} — ${messages.length} berichten`
+        ? `Chat: ${targetLabel(db.getDisplayName(chatJid, account), chatJid)} — ${messages.length} berichten`
         : `${messages.length} berichten uit meerdere chats`;
       const body = renderMessages(messages, {
         withChat: !chatJid,
         withId: include_ids ?? false,
+        withAccount: MULTI_ACCOUNT && !account,
         fullText: full_text ?? false,
         query,
       });
@@ -375,19 +512,24 @@ export function registerTools(server: McpServer): void {
         after: z.number().int().min(0).max(50).optional().describe("standaard 5"),
         include_ids: z.boolean().optional().describe("Toon bericht-IDs"),
         full_text: z.boolean().optional().describe(`Geen afkapping op ${MAX_BODY_CHARS} tekens`),
+        account: readAccountParam,
       },
     },
-    async ({ chat, message_id, before, after, include_ids, full_text }) => {
-      const resolved = requireResolved(resolveChatTarget(chat));
+    async ({ chat, message_id, before, after, include_ids, full_text, account }) => {
+      const resolved = requireResolved(resolveChatTarget(chat, { account }));
       if (!resolved.ok) return resolved.response;
-      const context = db.getMessageContext(resolved.jid, message_id, before, after);
+      const context = db.getMessageContext(resolved.jid, message_id, before, after, account);
       if (!context) return error("Bericht niet gevonden in de lokale geschiedenis.");
       const body = renderMessages([...context.before, context.message, ...context.after], {
         withId: include_ids ?? false,
         fullText: full_text ?? false,
         anchorId: context.message.id,
       });
-      return text(`${nowLine()}\nChat: ${targetLabel(db.getDisplayName(resolved.jid), resolved.jid)}\n${body}`);
+      return text(
+        `${nowLine()}\nChat: ${targetLabel(db.getDisplayName(resolved.jid, context.message.account), resolved.jid)}${accountTag(
+          context.message.account
+        )}\n${body}`
+      );
     }
   );
 
@@ -395,14 +537,16 @@ export function registerTools(server: McpServer): void {
     "get_last_interaction",
     {
       description: "Haal het meest recente bericht met een contact of groep op.",
-      inputSchema: { contact: z.string().describe("Naam, nummer of JID") },
+      inputSchema: { contact: z.string().describe("Naam, nummer of JID"), account: readAccountParam },
     },
-    async ({ contact }) => {
-      const resolved = requireResolved(resolveChatTarget(contact));
+    async ({ contact, account }) => {
+      const resolved = requireResolved(resolveChatTarget(contact, { account }));
       if (!resolved.ok) return resolved.response;
-      const last = db.getLastInteraction(resolved.jid);
+      const last = db.getLastInteraction(resolved.jid, account);
       if (!last) return text(`${nowLine()}\nGeen berichten met ${targetLabel(resolved.name, resolved.jid)}.`);
-      return text(`${nowLine()}\n${msgLine(last, { withChat: true, withId: true, withDate: true, fullText: true })}`);
+      return text(
+        `${nowLine()}\n${msgLine(last, { withChat: true, withId: true, withDate: true, withAccount: MULTI_ACCOUNT, fullText: true })}`
+      );
     }
   );
 
@@ -410,12 +554,15 @@ export function registerTools(server: McpServer): void {
     "get_direct_chat_by_contact",
     {
       description: "Vind het 1-op-1 gesprek met een specifiek contact.",
-      inputSchema: { contact: z.string().describe("Naam, nummer of JID") },
+      inputSchema: { contact: z.string().describe("Naam, nummer of JID"), account: readAccountParam },
     },
-    async ({ contact }) => {
-      const resolved = requireResolved(resolveChatTarget(contact, { directOnly: true }));
+    async ({ contact, account }) => {
+      const resolved = requireResolved(resolveChatTarget(contact, { directOnly: true, account }));
       if (!resolved.ok) return resolved.response;
-      return text(targetLabel(db.getDisplayName(resolved.jid), resolved.jid));
+      const accounts = MULTI_ACCOUNT ? chatAccounts(resolved.jid) : [];
+      return text(
+        `${targetLabel(db.getDisplayName(resolved.jid, account), resolved.jid)}${accounts.length ? ` [${accounts.join(", ")}]` : ""}`
+      );
     }
   );
 
@@ -423,12 +570,12 @@ export function registerTools(server: McpServer): void {
     "get_contact_chats",
     {
       description: "Lijst alle chats (1-op-1 en groepen) waarin dit contact voorkomt.",
-      inputSchema: { contact: z.string().describe("Naam, nummer of JID") },
+      inputSchema: { contact: z.string().describe("Naam, nummer of JID"), account: readAccountParam },
     },
-    async ({ contact }) => {
-      const resolved = requireResolved(resolveChatTarget(contact, { directOnly: true }));
+    async ({ contact, account }) => {
+      const resolved = requireResolved(resolveChatTarget(contact, { directOnly: true, account }));
       if (!resolved.ok) return resolved.response;
-      const chats = db.getChatsForSender(resolved.jid);
+      const chats = db.getChatsForSender(resolved.jid, account);
       if (!chats.length) return text("Geen chats gevonden voor dit contact.");
       return text(chats.map(chatLine).join("\n"));
     }
@@ -436,11 +583,21 @@ export function registerTools(server: McpServer): void {
 
   server.registerTool(
     "list_groups",
-    { description: "Toon alle groepschats.", inputSchema: {} },
-    async () => {
-      const groups = db.getGroups();
+    {
+      description: "Toon alle groepschats.",
+      inputSchema: { account: readAccountParam },
+    },
+    async ({ account }) => {
+      const groups = db.getGroups(account);
       if (!groups.length) return text("Geen groepen gevonden.");
-      return text(groups.map((g) => `${db.getDisplayName(g.jid)} — ${g.jid}`).join("\n"));
+      return text(
+        groups
+          .map((g) => {
+            const accounts = MULTI_ACCOUNT ? chatAccounts(g.jid) : [];
+            return `${db.getDisplayName(g.jid, g.account)} — ${g.jid}${accounts.length ? ` [${accounts.join(", ")}]` : ""}`;
+          })
+          .join("\n")
+      );
     }
   );
 
@@ -452,24 +609,27 @@ export function registerTools(server: McpServer): void {
         group: z.string().describe("Naam of JID van de groep"),
         include_jids: z.boolean().optional().describe("Toon leden-JIDs (standaard false)"),
         members_limit: z.number().int().positive().optional().describe("standaard 100"),
+        account: readAccountParam,
       },
     },
-    async ({ group, include_jids, members_limit }) => {
-      const resolved = requireResolved(resolveChatTarget(group, { groupOnly: true }));
+    async ({ group, include_jids, members_limit, account }) => {
+      const resolved = requireResolved(resolveChatTarget(group, { groupOnly: true, account }));
       if (!resolved.ok) return resolved.response;
+      const acct = accountForChat(resolved.jid, account);
       try {
-        const metadata = await getSocket().groupMetadata(resolved.jid);
+        const sock = await waitUntilConnected(acct);
+        const metadata = await sock.groupMetadata(resolved.jid);
         const limit = members_limit ?? 100;
         const participants = metadata.participants;
         const names = participants
           .slice(0, limit)
           .map(
             (p) =>
-              `${db.getDisplayName(p.id)}${include_jids ? ` (${displayJid(p.id)})` : ""}${p.admin ? ` [${p.admin}]` : ""}`
+              `${db.getDisplayName(p.id, acct)}${include_jids ? ` (${displayJid(p.id)})` : ""}${p.admin ? ` [${p.admin}]` : ""}`
           );
         const overflow = participants.length > limit ? ` (+${participants.length - limit} meer)` : "";
         const lines = [
-          `${metadata.subject} — ${resolved.jid}`,
+          `${metadata.subject} — ${resolved.jid}${accountTag(acct)}`,
           ...(metadata.desc ? [`Omschrijving: ${snippet(metadata.desc, 200)}`] : []),
           `Leden (${participants.length}): ${names.join(", ")}${overflow}`,
         ];
@@ -489,14 +649,15 @@ export function registerTools(server: McpServer): void {
         threshold_minutes: z.number().int().positive().optional().describe("standaard 30"),
         max_age_days: z.number().int().positive().optional().describe("standaard 30"),
         require_question: z.boolean().optional().describe("standaard true"),
+        account: readAccountParam,
       },
     },
-    async ({ threshold_minutes, max_age_days, require_question }) => {
-      const chats = db.getUnansweredChats(threshold_minutes ?? 30, max_age_days ?? 30, require_question ?? true);
+    async ({ threshold_minutes, max_age_days, require_question, account }) => {
+      const chats = db.getUnansweredChats(threshold_minutes ?? 30, max_age_days ?? 30, require_question ?? true, account);
       if (!chats.length) return text(`${nowLine()}\nGeen onbeantwoorde berichten.`);
       const lines = chats.map((c) => {
-        const last = db.getLastInteraction(c.jid);
-        return `${targetLabel(db.getDisplayName(c.jid), c.jid)}${
+        const last = db.getLastInteraction(c.jid, c.account);
+        return `${targetLabel(db.getDisplayName(c.jid, c.account), c.jid)}${accountTag(c.account)}${
           last ? ` — [${fmtTime(last.timestamp)}] ${snippet(last.text, 100)}` : ""
         }`;
       });
@@ -506,14 +667,15 @@ export function registerTools(server: McpServer): void {
 
   server.registerTool(
     "check_connection_status",
-    { description: "Controleer of de WhatsApp-verbinding actief is.", inputSchema: {} },
+    { description: "Controleer of de WhatsApp-verbindingen actief zijn.", inputSchema: {} },
     async () => {
-      const s = getStatus();
-      return text(
-        `${nowLine()}\nVerbinding: ${s.connectionState}${s.linkedNumber ? ` — gekoppeld als ${s.linkedNumber}` : ""}${
-          s.lastConnectedAt ? ` (sinds ${fmtTime(s.lastConnectedAt)})` : ""
-        }`
+      const lines = getStatuses().map(
+        (s) =>
+          `${s.account}: ${s.connectionState}${s.linkedNumber ? ` — gekoppeld als ${s.linkedNumber}` : ""}${
+            s.lastConnectedAt ? ` (sinds ${fmtTime(s.lastConnectedAt)})` : ""
+          }${s.canSend ? "" : " — verzenden geblokkeerd"}`
       );
+      return text(`${nowLine()}\n${lines.join("\n")}`);
     }
   );
 }

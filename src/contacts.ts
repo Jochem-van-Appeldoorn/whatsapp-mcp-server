@@ -1,4 +1,4 @@
-import { getDisplayName, searchChatsByName, searchContacts as searchContactsDb } from "./db.js";
+import { getDisplayName, searchChatsByName, searchContacts as searchContactsDb, accountsForChat } from "./db.js";
 
 export type ResolveResult =
   | { type: "resolved"; jid: string; name: string | null }
@@ -21,28 +21,35 @@ export function phoneToJid(input: string): string {
 /**
  * Resolves free-form input (JID, phone number, or a name to fuzzy-match
  * against contacts/group names) to a single WhatsApp JID.
+ *
+ * Met `account` wordt er alleen gezocht in wat dat nummer kent. Dat is nodig
+ * bij verzenden: een groep die alleen op het privénummer bestaat mag niet
+ * opeens als doel gelden voor een bericht vanaf het Claude-nummer.
  */
-export function resolveChatTarget(input: string, opts: { groupOnly?: boolean; directOnly?: boolean } = {}): ResolveResult {
+export function resolveChatTarget(
+  input: string,
+  opts: { groupOnly?: boolean; directOnly?: boolean; account?: string } = {}
+): ResolveResult {
   const trimmed = input.trim();
 
   if (isJid(trimmed)) {
-    return { type: "resolved", jid: trimmed, name: getDisplayName(trimmed) };
+    return { type: "resolved", jid: trimmed, name: getDisplayName(trimmed, opts.account) };
   }
 
   if (!opts.groupOnly && looksLikePhoneNumber(trimmed)) {
     const jid = phoneToJid(trimmed);
-    return { type: "resolved", jid, name: getDisplayName(jid) };
+    return { type: "resolved", jid, name: getDisplayName(jid, opts.account) };
   }
 
   const candidates = new Map<string, string | null>();
 
   if (!opts.directOnly) {
-    for (const chat of searchChatsByName(trimmed, true)) {
+    for (const chat of searchChatsByName(trimmed, true, opts.account)) {
       candidates.set(chat.jid, chat.name);
     }
   }
   if (!opts.groupOnly) {
-    for (const contact of searchContactsDb(trimmed)) {
+    for (const contact of searchContactsDb(trimmed, opts.account)) {
       candidates.set(contact.jid, contact.name);
     }
   }
@@ -56,4 +63,9 @@ export function resolveChatTarget(input: string, opts: { groupOnly?: boolean; di
     type: "ambiguous",
     candidates: [...candidates].map(([jid, name]) => ({ jid, name })),
   };
+}
+
+/** Accounts waarop deze chat voorkomt, om te tonen waar iets vandaan komt. */
+export function chatAccounts(jid: string): string[] {
+  return accountsForChat(jid);
 }

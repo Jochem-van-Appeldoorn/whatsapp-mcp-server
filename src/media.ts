@@ -58,10 +58,10 @@ async function convertToOggOpus(inputPath: string): Promise<Buffer> {
   }
 }
 
-export async function sendFile(jid: string, source: string, caption?: string): Promise<void> {
+export async function sendFile(account: string, jid: string, source: string, caption?: string): Promise<void> {
   const { buffer, filename } = await loadSource(source);
   const ext = extname(filename).toLowerCase();
-  const sock = await waitUntilConnected();
+  const sock = await waitUntilConnected(account);
 
   if (IMAGE_EXT.has(ext)) {
     await withSendTimeout(filename, sock.sendMessage(jid, { image: buffer, caption }));
@@ -75,10 +75,14 @@ export async function sendFile(jid: string, source: string, caption?: string): P
   }
 }
 
-export async function sendVoiceMessage(jid: string, source: string): Promise<{ sentAsVoiceNote: boolean; note?: string }> {
+export async function sendVoiceMessage(
+  account: string,
+  jid: string,
+  source: string
+): Promise<{ sentAsVoiceNote: boolean; note?: string }> {
   const isLocal = !/^https?:\/\//i.test(source);
   const ext = extname(source).toLowerCase();
-  const sock = await waitUntilConnected();
+  const sock = await waitUntilConnected(account);
 
   if (ext === ".ogg" || ext === ".opus") {
     const { buffer } = await loadSource(source);
@@ -87,7 +91,7 @@ export async function sendVoiceMessage(jid: string, source: string): Promise<{ s
   }
 
   if (!isFfmpegAvailable()) {
-    await sendFile(jid, source);
+    await sendFile(account, jid, source);
     return {
       sentAsVoiceNote: false,
       note: "ffmpeg is niet geïnstalleerd, dus het bestand is als gewoon audiobestand verstuurd (geen afspeelbaar voice-bericht). Installeer ffmpeg voor echte voice notes.",
@@ -113,12 +117,12 @@ export async function sendVoiceMessage(jid: string, source: string): Promise<{ s
   return { sentAsVoiceNote: true };
 }
 
-export async function downloadIncomingMedia(chatJid: string, messageId: string): Promise<string> {
-  const msg = getStoredMediaMessage(chatJid, messageId);
-  if (!msg) {
+export async function downloadIncomingMedia(chatJid: string, messageId: string, account?: string): Promise<string> {
+  const stored = getStoredMediaMessage(chatJid, messageId, account);
+  if (!stored) {
     throw new Error(
       "Geen media gevonden voor dit bericht. Media kan alleen gedownload worden als de server verbonden was toen het bericht binnenkwam."
     );
   }
-  return downloadMessageMedia(msg);
+  return downloadMessageMedia(stored.account, stored.msg);
 }

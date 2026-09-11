@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { connectWhatsApp } from "./whatsapp.js";
+import { connectAll } from "./whatsapp.js";
 import { registerTools } from "./tools.js";
 import { startReminders } from "./reminders.js";
 
@@ -13,6 +13,9 @@ function createServer(): McpServer {
     { name: "whatsapp-mcp-server", version: "1.2.0" },
     {
       instructions:
+        "Er zijn meerdere WhatsApp-nummers gekoppeld; list_accounts toont welke. Leestools kijken standaard in alle " +
+        "nummers en tonen per regel [account]. Verzenden gaat standaard vanaf het Claude-nummer; vanaf een geblokkeerd " +
+        "nummer (Davids eigen telefoon) gaat niets uit zonder dat David het in het gesprek heeft toegestaan. " +
         "Alle tijden zijn Europe/Amsterdam. Gebruik voor tijdsverwijzingen in berichten ('over 3 uur', 'morgen') altijd de actuele tijd uit de Nu:-regel in toolresultaten of get_current_time — nooit een aanname. " +
         "Conventies in output: berichtlijsten zijn chronologisch (oudste eerst) met dagkoppen '— wo 2026-07-02 —' en regels '[21:53] Afzender: tekst'; " +
         "kale nummers zijn telefoonnummers (@s.whatsapp.net weggelaten), @g.us is een groep, @lid is een intern id (geen telefoonnummer); " +
@@ -24,7 +27,7 @@ function createServer(): McpServer {
 }
 
 async function main() {
-  await connectWhatsApp();
+  await connectAll();
   startReminders(REMINDER_THRESHOLD_MINUTES);
 
   const app = createMcpExpressApp();
